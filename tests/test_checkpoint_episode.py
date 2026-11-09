@@ -70,6 +70,7 @@ def test_ordinary_native_checkpoint_seat_keeps_teacher_scaffold(
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
+            assert self.headers.get("x-api-key") == "fixture-private-checkpoint-key"
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             slot = int(self.headers["X-Coworld-Player-Slot"])
             view = json.JSONDecoder().raw_decode(body["messages"][0]["content"])[0]
@@ -126,6 +127,7 @@ def test_ordinary_native_checkpoint_seat_keeps_teacher_scaffold(
         "PYTHONPATH": str(ROOT / "src"),
         "COWORLD_LLM_ENDPOINT": f"http://127.0.0.1:{native.server_port}",
         "COWORLD_LLM_MODEL": TEACHER,
+        "COWORLD_LLM_API_KEY": "fixture-private-checkpoint-key",
         "COGAME_CONFIG_URI": (tmp_path / "config.json").as_uri(),
         "COGAME_RESULTS_URI": (tmp_path / "results.json").as_uri(),
         "COGAME_SAVE_REPLAY_URI": (tmp_path / "replay.json").as_uri(),
