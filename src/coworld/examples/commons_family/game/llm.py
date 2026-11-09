@@ -208,7 +208,8 @@ def build_transport() -> tuple[object | None, str]:
     endpoint = os.environ.get("COWORLD_LLM_ENDPOINT", "").strip()
     if endpoint:
         model = os.environ.get("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
-        return MessagesTransport(model, "sidecar", endpoint), model
+        key = os.environ.get("COWORLD_LLM_API_KEY", "sidecar")
+        return MessagesTransport(model, key, endpoint), model
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         uri = os.environ.get("ANTHROPIC_API_KEY_URI")
