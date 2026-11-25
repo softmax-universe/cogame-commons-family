@@ -14,7 +14,7 @@ container, so that all six seats' LLM calls can go out as one parallel batch per
 
 `scripted` non-empty wins, and must name one of
 `steward, free_rider, cleaner, punisher, reciprocator, deterrable, random`.
-A seat that does not register within 5 s of connect has no registered policy and records missed turns unless it sends `decision` frames over its websocket.
+A seat that does not register within 5 s of connect has no registered policy and must send valid `decision` frames over its websocket; missing or disconnected seats fail the episode explicitly as `episode_inconclusive` without substituting a pass action.
 
 The reference player (`/bin/commons-family-player`) sends `PLAYER_PROMPT` and `PLAYER_SCRIPTED`
 from its environment and then spectates.
@@ -109,4 +109,4 @@ choose their own actions over the same observation and decision frames.
 | `message` | all | text or null | ≤ 140 runes | truncated (non-string rejected) |
 | `note` | all | text or null | ≤ 200 runes | truncated (non-string rejected) |
 
-Invalid or unparseable model replies are retried once with the validation error and, if still invalid, rejected with no synthesized fallback action. Missing credentials or transport failures fail the episode explicitly without fabricating `results.json`. Every free-text field is truncated on **rune** boundaries, never byte boundaries, and `note` is private: it is echoed back only to its own seat and never written to the replay.
+Each prompt seat makes a single model call per round with no hidden retries or scripted fallbacks. Invalid or unparseable model or player replies fail the episode explicitly as an unscored `player_error` attributed to the failing seat (`COGAME_PLAYER_FAILURE_URI`). Missing credentials, provider/HTTP/transport failures, timeouts, throttling, or missing/disconnected seats fail the episode explicitly as an unscored `episode_inconclusive` without fabricating `results.json` or broadcasting private error details to other players. Every free-text field is truncated on **rune** boundaries, never byte boundaries, and `note` is private: it is echoed back only to its own seat and never written to the replay.

@@ -230,12 +230,12 @@ def test_ordinary_native_checkpoint_seat_keeps_teacher_scaffold(
         # without fabricating results.json or replay.json, while preserving raw evidence.
         assert not (tmp_path / "results.json").exists()
         assert not (tmp_path / "replay.json").exists()
-        assert len(calls) == 3  # slot 0 (1 call) + slot 1 (2 attempts)
+        assert len(calls) == 2  # slot 0 (1 call) + slot 1 (1 attempt, no retries)
         episode = records[-1]
         assert episode["status"] == "failed"
         assert "transport" in episode["outcome"]["runtime_error"]
         unsettled = episode["outcome"]["unsettled_model_attempts"]["1"]
-        assert len(unsettled) == 2
+        assert len(unsettled) == 1
         assert all(
             a["rejection_reason"] == "checkpoint serving identity mismatch"
             and a["model_identity"] == "f" * 64

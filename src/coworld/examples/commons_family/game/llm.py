@@ -2,7 +2,8 @@
 
 Hosted requests prefer COWORLD_LLM_ENDPOINT, carry the requesting seat, and
 use canonical OpenRouter models. Local play can use provider credentials.
-The game owns parallel dispatch, retries, and its scripted fallback.
+The game owns parallel dispatch with one call per prompt seat and no hidden
+retries or scripted fallbacks.
 """
 
 from __future__ import annotations
@@ -39,27 +40,19 @@ logger = get_logger("commons_family.llm")
 
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 
-# Meadow's ladder was (1, 2, 4, 8, 16, 30, 60) — two minutes, far past our
-# 20 s round deadline. Truncated to fit inside one round.
-THROTTLE_SLEEPS = (0.5, 1.0, 2.0)
-
-RETRY_HINT = (
-    "Your last reply was not usable. Reply with ONE JSON object beginning with { and only the fields in the schema."
-)
-
 SANCTION_RULES = "\nYou may also sanction one cog per round: you pay {cost}, they lose {burn}."
 
 
 class LlmThrottled(Exception):
-    """The provider asked us to slow down. Retryable."""
+    """The provider asked us to slow down."""
 
 
 class LlmTimeout(Exception):
-    """The call did not answer inside its deadline. Retryable."""
+    """The call did not answer inside its deadline."""
 
 
 class LlmTransportError(Exception):
-    """Anything else that is not the model's fault. Retryable once."""
+    """Anything else that is not the model's fault."""
 
 
 class LlmRateBudget(Exception):
@@ -375,9 +368,10 @@ class LlmDecider:
         *,
         checkpoint_models: dict[int, str] | None = None,
     ) -> dict[int, tuple[dict | None, str]]:
-        """One parallel batch. Returns `{slot: (reply | None, cause)}`.
+        """One parallel batch with one call per prompt seat.
 
-        `cause` is empty on success and one of `timeout, parse, rate_budget,
+        Returns `{slot: (reply | None, cause)}`. `cause` is empty on success and
+        one of `timeout, throttled, parse, invalid_action, rate_budget,
         transport, disabled` otherwise. Nothing here blocks past `deadline`.
         """
         self.checkpoint_models = {
@@ -420,66 +414,46 @@ class LlmDecider:
             self._systems[slot] = self.system_prompt(obs, standing_orders)
         system = self._systems[slot]
         user = self.user_message(obs)
-        cause = "timeout"
-        last_error = ""
-        last_raw = ""
-        for attempt in range(2):
-            if attempt == 0:
-                text = user
-            elif last_error:
-                text = f"{user}\n\n{RETRY_HINT} Error: {last_error}"
-            else:
-                text = f"{user}\n\n{RETRY_HINT}"
-            try:
-                raw = self._complete(system, text, deadline, slot)
-            except LlmRateBudget as error:
-                self._record_failure(slot, "rate_budget", str(error))
-                return None, "rate_budget"
-            except LlmTimeout as error:
-                cause = "timeout"
-                last_error = str(error)
-                continue
-            except LlmThrottled as error:
-                cause = "timeout"
-                last_error = str(error)
-                continue
-            except LlmTransportError as error:
-                logger.warning("slot %d transport error: %s", slot, error)
-                cause = "transport"
-                last_error = str(error)
-                continue
-            except Exception as error:
-                logger.exception("slot %d unclassified LLM failure", slot)
-                cause = "transport"
-                last_error = str(error)
-                continue
-            if raw is None:
-                cause = "timeout"
-                last_error = "empty response"
-                continue
-            last_raw = raw
-            parsed = extract_json(raw)
-            if parsed is None:
-                if self.attempts.get(slot):
-                    self.attempts[slot][-1]["rejection_reason"] = "no JSON object"
-                logger.warning("slot %d unusable reply: %r", slot, raw[:200])
-                cause = "parse"
-                last_error = "no JSON object"
-                continue
-            try:
-                parse_decision(parsed, slot, self.config, None, self.module, "llm")
-            except ValueError as error:
-                if self.attempts.get(slot):
-                    self.attempts[slot][-1]["rejection_reason"] = str(error)
-                logger.warning("slot %d invalid decision: %s (raw=%r)", slot, error, raw[:200])
-                cause = "invalid_action"
-                last_error = str(error)
-                continue
+        try:
+            raw = self._complete(system, user, deadline, slot)
+        except LlmRateBudget as error:
+            self._record_failure(slot, "rate_budget", str(error))
+            return None, "rate_budget"
+        except LlmTimeout as error:
+            self._record_failure(slot, "timeout", str(error))
+            return None, "timeout"
+        except LlmThrottled as error:
+            self._record_failure(slot, "throttled", str(error))
+            return None, "throttled"
+        except LlmTransportError as error:
+            logger.warning("slot %d transport error: %s", slot, error)
+            self._record_failure(slot, "transport", str(error))
+            return None, "transport"
+        except Exception as error:
+            logger.exception("slot %d unclassified LLM failure", slot)
+            self._record_failure(slot, "transport", str(error))
+            return None, "transport"
+        if raw is None:
+            self._record_failure(slot, "transport", "empty response")
+            return None, "transport"
+        parsed = extract_json(raw)
+        if parsed is None:
             if self.attempts.get(slot):
-                self.attempts[slot][-1]["_proposal"] = parsed
-            return parsed, ""
-        self._record_failure(slot, cause, last_error or cause, last_raw)
-        return None, cause
+                self.attempts[slot][-1]["rejection_reason"] = "no JSON object"
+            logger.warning("slot %d unusable reply", slot)
+            self._record_failure(slot, "parse", "no JSON object", raw)
+            return None, "parse"
+        try:
+            parse_decision(parsed, slot, self.config, None, self.module, "llm")
+        except ValueError as error:
+            if self.attempts.get(slot):
+                self.attempts[slot][-1]["rejection_reason"] = str(error)
+            logger.warning("slot %d invalid decision: %s", slot, error)
+            self._record_failure(slot, "invalid_action", str(error), raw)
+            return None, "invalid_action"
+        if self.attempts.get(slot):
+            self.attempts[slot][-1]["_proposal"] = parsed
+        return parsed, ""
 
     def _complete(self, system: str, user: str, deadline: float, slot: int) -> str | None:
         # Pre-4.6 models narrate their analysis and never reach the JSON unless
@@ -501,33 +475,21 @@ class LlmDecider:
         if not prefill:
             body["output_config"] = {"effort": "low"}
 
-        for sleep_seconds in (*THROTTLE_SLEEPS, None):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise LlmTimeout("round deadline reached")
-            timeout = min(self.config.decision_timeout_seconds, remaining)
-            if not self._take_budget():
-                raise LlmRateBudget("requests-per-minute budget spent")
-            try:
-                completion = self.transport.complete(body, timeout, slot)  # type: ignore[union-attr]
-            except LlmThrottled:
-                if sleep_seconds is None:
-                    raise
-                time.sleep(min(sleep_seconds, max(0.0, deadline - time.monotonic())))
-                continue
-            if completion is None:
-                return None
-            if prefill:
-                return completion if completion.lstrip().startswith(("{", "```")) else "{" + completion
-            return completion
-        raise LlmThrottled("throttled past the ladder")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LlmTimeout("round deadline reached")
+        timeout = min(self.config.decision_timeout_seconds, remaining)
+        if not self._take_budget():
+            raise LlmRateBudget("requests-per-minute budget spent")
+        completion = self.transport.complete(body, timeout, slot)  # type: ignore[union-attr]
+        if completion is None:
+            return None
+        if prefill:
+            return completion if completion.lstrip().startswith(("{", "```")) else "{" + completion
+        return completion
 
     def _take_budget(self) -> bool:
-        """A rolling requests-per-minute budget; retries draw from it too.
-
-        A seat that cannot be called because the budget is exhausted plays its
-        fallback baseline for that round rather than waiting for the window.
-        """
+        """A rolling requests-per-minute budget shared across prompt seats."""
         now = time.monotonic()
         with self._lock:
             while self._budget and now - self._budget[0] > 60.0:

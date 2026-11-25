@@ -17,6 +17,7 @@ from typing import Any
 from coworld.examples.commons_family.game.baselines import make_baseline
 from coworld.examples.commons_family.game.engine import (
     CommonsConfig,
+    EpisodeFailure,
     GameState,
     module_for,
     new_game,
@@ -99,54 +100,53 @@ def run_episode(
                         raw[slot] = decide(slot)
                         src[slot] = f"scripted:{getattr(policies[slot], 'name', 'baseline')}"
 
-                llm_failures: dict[int, tuple[str, dict[str, Any]]] = {}
                 if prompts and decider is not None:
                     requests = {slot: (observations[slot], prompts[slot]) for slot in prompts}
                     answers = decider.decide(requests, time.monotonic() + config.round_seconds)
                     if hasattr(decider, "capture"):
                         decider.capture.parse_model_replies(answers, config, state, module)
-                    for slot, (reply, cause) in answers.items():
+                    for slot in sorted(answers):
+                        reply, cause = answers[slot]
                         if reply is not None:
                             raw[slot] = reply
                             src[slot] = "llm"
                             continue
                         detail = getattr(decider, "last_failures", {}).get(slot, {})
-                        if cause in ("disabled", "transport"):
-                            reason_text = detail.get("reason") or cause
-                            raise RuntimeError(f"LLM {cause} failure for slot {slot}: {reason_text}")
-                        llm_failures[slot] = (cause, detail)
+                        reason_text = detail.get("reason") or cause
+                        if cause in ("parse", "invalid_action"):
+                            raise EpisodeFailure(
+                                "player_error",
+                                slot,
+                                "Player submitted an invalid decision",
+                                f"LLM {cause} for slot {slot}: {reason_text}",
+                            )
+                        raise EpisodeFailure(
+                            "episode_inconclusive",
+                            slot,
+                            "Model inference unavailable",
+                            f"LLM {cause} for slot {slot}: {reason_text}",
+                        )
 
                 decisions = []
                 for slot in range(config.num_agents):
-                    if slot in raw:
-                        decisions.append(
-                            parse_decision(raw[slot], slot, config, state, module, src.get(slot, "pass"))
+                    if slot not in raw:
+                        raise EpisodeFailure(
+                            "episode_inconclusive",
+                            slot,
+                            "Player did not submit a decision",
+                            f"seat {slot} submitted no decision on round {state.round}",
                         )
-                        continue
-                    if slot in llm_failures:
-                        cause, detail = llm_failures[slot]
-                        is_rejected = cause in ("parse", "invalid_action")
-                        decision_src = f"rejected:{cause}" if is_rejected else f"missed:{cause}"
-                        event: dict[str, Any] = {
-                            "kind": "no_submission",
-                            "r": state.round,
-                            "slot": slot,
-                            "alias": state.aliases[slot],
-                            "cause": cause,
-                            "text": (
-                                f"{state.aliases[slot]} reply rejected ({cause})."
-                                if is_rejected
-                                else f"{state.aliases[slot]} missed the turn ({cause})."
-                            ),
-                        }
-                        if detail.get("reason"):
-                            event["rejection_reason"] = str(detail["reason"])[:240]
-                        if detail.get("raw_reply"):
-                            event["raw_reply"] = str(detail["raw_reply"])[:400]
-                        state.events.append(event)
-                        decisions.append(parse_decision({}, slot, config, state, module, decision_src))
-                        continue
-                    decisions.append(parse_decision({}, slot, config, state, module, "pass"))
+                    try:
+                        decisions.append(
+                            parse_decision(raw[slot], slot, config, state, module, src.get(slot, "player"))
+                        )
+                    except ValueError as error:
+                        raise EpisodeFailure(
+                            "player_error",
+                            slot,
+                            "Player submitted an invalid decision",
+                            f"Invalid decision for slot {slot}: {error}",
+                        ) from error
                 settle_round(state, decisions, config, module)
                 if decider is not None and hasattr(decider, "capture"):
                     decider.capture.record_round(
@@ -155,8 +155,20 @@ def run_episode(
     except Exception as error:
         if decider is not None and hasattr(decider, "capture"):
             decider.capture.failure = str(error)
-            decider.capture.finish(results(state, config, module, "deadline",
-                                           default_player_names(config.num_agents), decider.requests))
+            failure_outcome: dict[str, Any] = {
+                "reason": "failed",
+                "error": str(error),
+                "rounds": state.round,
+                "scores": [round(score, 3) for score in state.scores],
+                "llm_requests": decider.requests,
+                "names": default_player_names(config.num_agents),
+                "aliases": list(state.aliases),
+            }
+            if isinstance(error, EpisodeFailure):
+                failure_outcome["failure_kind"] = error.kind
+                failure_outcome["failed_policy_index"] = error.slot
+                failure_outcome["public_message"] = error.public_message
+            decider.capture.finish(failure_outcome)
         raise
 
     state.events.append(
