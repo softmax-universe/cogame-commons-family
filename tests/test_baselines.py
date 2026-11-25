@@ -35,16 +35,24 @@ def _warm(config, state, module, rounds: int, rng: random.Random) -> None:
     for _ in range(rounds):
         raws = []
         for slot in range(config.num_agents):
+            harvest = rng.randint(0, config.effort_budget)
+            clean = rng.randint(0, config.effort_budget - harvest)
+            eat = rng.randint(0, config.effort_budget)
+            plant = rng.randint(0, config.effort_budget - eat)
             raws.append(
                 {
-                    "harvest": rng.randint(0, config.effort_budget),
-                    "clean": rng.randint(0, 1),
+                    "harvest": harvest,
+                    "clean": clean,
                     "patch": rng.randrange(config.patch_count),
-                    "eat": rng.randint(0, config.effort_budget),
+                    "eat": eat,
                     "eat_color": rng.choice(COLORS),
-                    "plant": rng.randint(0, 1),
+                    "plant": plant,
                     "plant_color": rng.choice(COLORS),
-                    "sanction": rng.choice([None, (slot + 1) % config.num_agents]),
+                    "sanction": (
+                        rng.choice([None, (slot + 1) % config.num_agents])
+                        if config.sanctions_enabled
+                        else None
+                    ),
                     "message": "warm-up",
                 }
             )
@@ -190,7 +198,7 @@ def test_every_baseline_survives_the_validator_unchanged_in_bounds(baseline_name
     The validator clamps, so an out-of-range order would be silently corrected
     rather than rejected; this asserts there is nothing to correct.
     """
-    config = CommonsConfig(module=module_name, num_agents=6)
+    config = CommonsConfig(module=module_name, num_agents=6, sanctions_enabled=True)
     module = module_for(config)
     state = new_game(config)
     baseline = make_baseline(baseline_name, seed=5)
@@ -214,9 +222,9 @@ def test_the_registry_names_are_exactly_the_documented_seven():
     ]
 
 
-def test_an_unknown_scripted_name_degrades_to_the_default_rather_than_raising():
-    baseline = make_baseline("no-such-policy", seed=1)
-    assert baseline.name == "steward"
+def test_an_unknown_scripted_name_raises_value_error():
+    with pytest.raises(ValueError, match="unknown baseline"):
+        make_baseline("no-such-policy", seed=1)
 
 
 def test_open_room_stewards_spread_across_the_patches_instead_of_queueing():

@@ -22,7 +22,12 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from coworld.examples.commons_family.game.modules.allelopathic import AllelopathicModule
-from coworld.examples.commons_family.game.modules.base import COLORS, Decision, Module
+from coworld.examples.commons_family.game.modules.base import (
+    COLORS,
+    Decision,
+    Module,
+    is_missed_turn_src,
+)
 from coworld.examples.commons_family.game.modules.cleanup import CleanupModule
 from coworld.examples.commons_family.game.modules.harvest import HarvestModule
 from coworld.examples.commons_family.game.modules.mushrooms import MushroomsModule
@@ -112,7 +117,6 @@ class CommonsConfig(BaseModel):
     chat_enabled: bool = True
     chat_max_chars: int = Field(default=140, ge=1, le=1000)
     norm_text: str = ""
-    fallback_scripted: str = "steward"
     llm_max_requests_per_minute: int = Field(default=120, ge=1)
 
     @field_validator("norm_text")
@@ -268,34 +272,52 @@ def new_game(config: CommonsConfig) -> GameState:
 
 
 def parse_decision(
-    raw: object, slot: int, config: CommonsConfig, state: GameState, module: Module, src: str
+    raw: object, slot: int, config: CommonsConfig, state: GameState | None, module: Module, src: str
 ) -> Decision:
-    """Validate one raw reply into a bounded `Decision`.
+    """Strictly validate one raw reply into a `Decision`, or return a missed-turn sentinel.
 
-    Every integer is clamped to its range, every colour to the enum, the effort
-    budget is enforced by reducing the MAINTENANCE field first, a sanction is
-    dropped unless sanctions are on and the target is a real other seat, and
-    every free-text field is truncated on rune boundaries.
+    Missed/rejected turns (`pass`, `missed:*`, `rejected:*`) return an empty
+    `Decision(src=src)` without synthesizing an action. Submitted replies must be
+    JSON objects whose module fields are in range and within the effort budget,
+    and whose optional `sanction`, `message`, and `note` fields have valid types.
     """
-    decision = module.parse_decision(raw, slot, config, state.module_state)
-    decision.src = src
+    if is_missed_turn_src(src):
+        return Decision(src=src)
     if not isinstance(raw, dict):
-        return decision
+        raise ValueError("decision must be a JSON object")
 
-    if config.sanctions_enabled:
-        sanction_raw = raw.get("sanction")
-        if (
-            isinstance(sanction_raw, (int, float))
-            and not isinstance(sanction_raw, bool)
-            and int(sanction_raw) != slot
-            and 0 <= int(sanction_raw) < config.num_agents
-        ):
-            decision.sanction = int(sanction_raw)
+    module_state = state.module_state if state is not None else {}
+    decision = module.parse_decision(raw, slot, config, module_state)
+    decision.src = src
 
-    if config.chat_enabled:
-        message = truncate_runes(raw.get("message"), config.chat_max_chars)
-        decision.message = message or None
-    decision.note = truncate_runes(raw.get("note"), NOTE_MAX_CHARS) or None
+    sanction_raw = raw.get("sanction")
+    if sanction_raw is not None:
+        if not config.sanctions_enabled:
+            raise ValueError("sanctions are disabled in this episode")
+        if isinstance(sanction_raw, bool) or not isinstance(sanction_raw, int):
+            raise ValueError(f"sanction must be a cog slot integer or null, got {sanction_raw!r}")
+        if sanction_raw == slot:
+            raise ValueError(f"cannot sanction yourself (slot {slot})")
+        if not (0 <= sanction_raw < config.num_agents):
+            raise ValueError(
+                f"sanction target must be in 0..{config.num_agents - 1}, got {sanction_raw}"
+            )
+        decision.sanction = sanction_raw
+
+    message_raw = raw.get("message")
+    if message_raw is not None:
+        if not isinstance(message_raw, str):
+            raise ValueError(f"message must be a string or null, got {message_raw!r}")
+        if config.chat_enabled:
+            message = truncate_runes(message_raw, config.chat_max_chars)
+            decision.message = message or None
+
+    note_raw = raw.get("note")
+    if note_raw is not None:
+        if not isinstance(note_raw, str):
+            raise ValueError(f"note must be a string or null, got {note_raw!r}")
+        decision.note = truncate_runes(note_raw, NOTE_MAX_CHARS) or None
+
     return decision
 
 

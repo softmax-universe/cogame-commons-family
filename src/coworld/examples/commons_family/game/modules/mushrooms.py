@@ -15,8 +15,8 @@ from coworld.examples.commons_family.game.modules.base import (
     COLORS,
     Decision,
     Module,
-    clamp_color,
-    clamp_int,
+    parse_color,
+    parse_int,
     pro_rata,
 )
 
@@ -33,11 +33,10 @@ class MushroomsModule(Module):
 
     def parse_decision(self, raw: object, slot: int, config: Any, state: dict) -> Decision:
         if not isinstance(raw, dict):
-            return Decision()
-        return Decision(
-            eat=clamp_int(raw.get("eat", 0), 0, config.effort_budget),
-            eat_color=clamp_color(raw.get("eat_color"), "red"),
-        )
+            raise ValueError("decision must be a JSON object")
+        eat = parse_int(raw, "eat", 0, config.effort_budget, required=True)
+        eat_color = parse_color(raw, "eat_color", required=(eat > 0), default="red")
+        return Decision(eat=eat, eat_color=eat_color)
 
     def _values(self, config: Any) -> dict[str, float]:
         return {
@@ -202,7 +201,8 @@ class MushroomsModule(Module):
         return (
             f'{{"eat": <int 0..{config.effort_budget}>, "eat_color": "red|green|blue", '
             '"sanction": <cog slot int or null>, "message": "<one public line>", '
-            '"note": "<private reminder to yourself>"}'
+            '"note": "<private reminder to yourself>"}\n'
+            'Example: {"eat": 1, "eat_color": "green", "sanction": null, "message": "Eating 1 green.", "note": "Green helps everyone."}'
         )
 
     def rules_text(self, config: Any) -> str:

@@ -199,9 +199,13 @@ def test_ordinary_native_checkpoint_seat_keeps_teacher_scaffold(
         while any(p.poll() is None for p in processes):
             assert time.monotonic() < deadline, (tmp_path / "server.log").read_text()
             time.sleep(0.1)
-        assert all(p.returncode == 0 for p in processes), (
-            tmp_path / "server.log"
-        ).read_text()
+        if wrong_identity:
+            assert server.returncode != 0, (tmp_path / "server.log").read_text()
+            assert all(p.returncode == 0 for p in processes[1:])
+        else:
+            assert all(p.returncode == 0 for p in processes), (
+                tmp_path / "server.log"
+            ).read_text()
     finally:
         for process in processes:
             if process.poll() is None:
@@ -217,15 +221,33 @@ def test_ordinary_native_checkpoint_seat_keeps_teacher_scaffold(
         thread.join(timeout=5)
         for stream in logs:
             stream.close()
-    assert len(calls) == (60 if wrong_identity else 40)
-    assert {slot: sum(c["slot"] == slot for c in calls) for slot in range(2)} == {
-        0: 20,
-        1: 40 if wrong_identity else 20,
-    }
     records = [
         json.loads(line)
         for line in (tmp_path / "private/episode.jsonl").read_text().splitlines()
     ]
+    if wrong_identity:
+        # Transport / checkpoint serving identity mismatch fails explicitly on round 0
+        # without fabricating results.json or replay.json, while preserving raw evidence.
+        assert not (tmp_path / "results.json").exists()
+        assert not (tmp_path / "replay.json").exists()
+        assert len(calls) == 3  # slot 0 (1 call) + slot 1 (2 attempts)
+        episode = records[-1]
+        assert episode["status"] == "failed"
+        assert "transport" in episode["outcome"]["runtime_error"]
+        unsettled = episode["outcome"]["unsettled_model_attempts"]["1"]
+        assert len(unsettled) == 2
+        assert all(
+            a["rejection_reason"] == "checkpoint serving identity mismatch"
+            and a["model_identity"] == "f" * 64
+            for a in unsettled
+        )
+        assert not thread.is_alive()
+        return
+    assert len(calls) == 40
+    assert {slot: sum(c["slot"] == slot for c in calls) for slot in range(2)} == {
+        0: 20,
+        1: 20,
+    }
     decisions, episode = records[:-1], records[-1]
     assert len(decisions) == 120 and episode["status"] == "completed"
     assert episode["outcome"]["reason"] == "complete"

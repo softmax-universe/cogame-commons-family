@@ -14,7 +14,7 @@ from typing import Any
 from coworld.examples.commons_family.game.modules.base import (
     Decision,
     Module,
-    clamp_int,
+    parse_int,
     pro_rata,
 )
 
@@ -33,13 +33,15 @@ class CleanupModule(Module):
 
     def parse_decision(self, raw: object, slot: int, config: Any, state: dict) -> Decision:
         if not isinstance(raw, dict):
-            return Decision()
-        harvest = clamp_int(raw.get("harvest", 0), 0, config.effort_budget)
-        clean = clamp_int(raw.get("clean", 0), 0, config.effort_budget)
-        # Maintenance yields first: the extractive field is what the seat asked
-        # for, and an over-budget reply loses its clean units, not its harvest.
+            raise ValueError("decision must be a JSON object")
+        if "harvest" not in raw and "clean" not in raw:
+            raise ValueError("cleanup decision must include 'harvest' or 'clean'")
+        harvest = parse_int(raw, "harvest", 0, config.effort_budget, default=0)
+        clean = parse_int(raw, "clean", 0, config.effort_budget, default=0)
         if harvest + clean > config.effort_budget:
-            clean = max(0, config.effort_budget - harvest)
+            raise ValueError(
+                f"harvest ({harvest}) + clean ({clean}) exceeds effort_budget ({config.effort_budget})"
+            )
         return Decision(harvest=harvest, clean=clean)
 
     def resolve(
@@ -135,7 +137,8 @@ class CleanupModule(Module):
             f'{{"harvest": <int 0..{cap}>, "clean": <int 0..{cap}>, '
             '"sanction": <cog slot int or null>, "message": "<one public line>", '
             '"note": "<private reminder to yourself>"}'
-            f" — harvest + clean must not exceed {cap}."
+            f" — harvest + clean must not exceed {cap}.\n"
+            'Example: {"harvest": 1, "clean": 1, "sanction": null, "message": "Taking 1 and cleaning 1.", "note": "Keep river clean."}'
         )
 
     def rules_text(self, config: Any) -> str:

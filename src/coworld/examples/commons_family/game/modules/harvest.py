@@ -17,7 +17,8 @@ from typing import Any
 from coworld.examples.commons_family.game.modules.base import (
     Decision,
     Module,
-    clamp_int,
+    is_missed_turn_src,
+    parse_int,
     pro_rata,
 )
 
@@ -73,10 +74,10 @@ class HarvestModule(Module):
 
     def parse_decision(self, raw: object, slot: int, config: Any, state: dict) -> Decision:
         if not isinstance(raw, dict):
-            return Decision()
+            raise ValueError("decision must be a JSON object")
         return Decision(
-            harvest=clamp_int(raw.get("harvest", 0), 0, config.effort_budget),
-            patch=clamp_int(raw.get("patch", 0), 0, config.patch_count - 1),
+            harvest=parse_int(raw, "harvest", 0, config.effort_budget, required=True),
+            patch=parse_int(raw, "patch", 0, config.patch_count - 1, required=True),
         )
 
     def resolve(
@@ -90,7 +91,7 @@ class HarvestModule(Module):
         # all-zero default, and counting that as "holding patch 0" would let a
         # disconnected seat's partner harvest patch 0 alone every round while
         # patch 1 could never be held at all.
-        answered = [decision.src != "pass" for decision in decisions]
+        answered = [not is_missed_turn_src(decision.src) for decision in decisions]
 
         named: dict[int, set[int]] = {}
         for slot, decision in enumerate(decisions):
@@ -253,7 +254,8 @@ class HarvestModule(Module):
             f'{{"patch": <int 0..{config.patch_count - 1}>, '
             f'"harvest": <int 0..{config.effort_budget}>, '
             '"sanction": <cog slot int or null>, "message": "<one public line>", '
-            '"note": "<private reminder to yourself>"}'
+            '"note": "<private reminder to yourself>"}\n'
+            'Example: {"patch": 0, "harvest": 1, "sanction": null, "message": "Taking 1 from patch 0.", "note": "Keep patches above 1."}'
         )
 
     def rules_text(self, config: Any) -> str:

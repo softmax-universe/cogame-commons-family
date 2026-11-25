@@ -67,7 +67,7 @@ POST_GAME_MAX_LINGER_SECONDS = float(
     os.environ.get("COMMONS_FAMILY_POST_GAME_MAX_LINGER_SECONDS", "90")
 )
 # How long a connected socket has to send its `prompt` registration before the
-# seat is treated as `{"scripted": "steward"}`. Never a disconnect.
+# episode starts without a registered policy for that seat.
 REGISTRATION_GRACE_SECONDS = 5.0
 
 RAW_CONFIG: dict[str, Any] = json.loads(read_data(os.environ["COGAME_CONFIG_URI"]))
@@ -129,6 +129,8 @@ class GameSession:
         self.done = False
         self.paused = False
         self.reason = ""
+        self.failed = False
+        self.exit_code = 0
         self.round_seconds = CONFIG.round_seconds
         self.global_viewers = 0
         self.decider = LlmDecider(CONFIG, MODULE, prompt_selection=PromptSelection.model_validate(RAW_CONFIG))
@@ -315,11 +317,7 @@ def _policy_for(slot: int):
     elif registration.get("prompt"):
         policy = ("prompt", registration["prompt"], registration.get("checkpoint_model", ""))
     else:
-        policy = (
-            "scripted",
-            make_baseline(CONFIG.fallback_scripted, seed=CONFIG.seed * 1000 + slot),
-            CONFIG.fallback_scripted,
-        )
+        policy = ("unregistered", None, "")
     session.policies[slot] = policy
     return policy
 
@@ -335,21 +333,14 @@ def _seat_kinds() -> list[str]:
 
 
 async def _play_game() -> None:
-    """Run the episode; whatever happens, write artifacts and stop.
-
-    Nobody awaits this task (it is created from a websocket handler and from
-    the connect-timeout task), so an exception escaping it would be swallowed
-    by the event loop and the container would sit there until the platform's
-    episode timeout killed it, with no results.json and no replay.json. The
-    guard turns any unexpected failure into a settled episode with the rounds
-    that were played.
-    """
+    """Run the episode; fail explicitly on fatal/transport/credential errors without fabricating results."""
     try:
         reason = await _run_episode()
     except Exception as error:
         session.decider.capture.failure = str(error)
-        logger.exception("the round loop failed; settling on the rounds already played")
-        reason = "complete"
+        logger.exception("episode failed explicitly; not writing fabricated results")
+        await _fail_episode(error)
+        return
     await _finish(reason)
 
 
@@ -399,12 +390,6 @@ async def _run_episode() -> str:
             ),
         }
     )
-
-    fallback_seed_base = CONFIG.seed * 7919
-    fallbacks = {
-        slot: make_baseline(CONFIG.fallback_scripted, seed=fallback_seed_base + slot)
-        for slot in range(CONFIG.num_agents)
-    }
 
     def note_deadline() -> None:
         engine.events.append(
@@ -467,7 +452,7 @@ async def _run_episode() -> str:
             if kind == "scripted":
                 raw[slot] = payload.act(observations[slot])
                 src[slot] = f"scripted:{label}"
-            else:
+            elif kind == "prompt":
                 prompt_requests[slot] = (observations[slot], payload)
                 if label:
                     checkpoint_models[slot] = label
@@ -482,27 +467,17 @@ async def _run_episode() -> str:
         else:
             answers = {}
         session.decider.capture.parse_model_replies(answers, CONFIG, engine, MODULE)
+        llm_failures: dict[int, tuple[str, dict[str, Any]]] = {}
         for slot, (reply, cause) in answers.items():
             if reply is not None:
                 raw[slot] = reply
                 src[slot] = "llm"
                 continue
-            raw[slot] = fallbacks[slot].act(observations[slot])
-            src[slot] = f"fallback:{cause}"
-            engine.fallbacks[slot] += 1
-            engine.events.append(
-                {
-                    "kind": "fallback",
-                    "r": engine.round,
-                    "slot": slot,
-                    "alias": engine.aliases[slot],
-                    "cause": cause,
-                    "text": (
-                        f"{engine.aliases[slot]} fell back to "
-                        f"{CONFIG.fallback_scripted} — {cause}"
-                    ),
-                }
-            )
+            detail = session.decider.last_failures.get(slot, {})
+            if cause in ("disabled", "transport"):
+                reason_text = detail.get("reason") or cause
+                raise RuntimeError(f"LLM {cause} failure for slot {slot}: {reason_text}")
+            llm_failures[slot] = (cause, detail)
 
         # The pacing floor: an all-scripted episode would otherwise settle
         # twenty rounds in a fraction of a second, which gives the hosted
@@ -519,23 +494,65 @@ async def _run_episode() -> str:
 
         decisions = []
         for slot in range(CONFIG.num_agents):
-            if slot not in raw:
-                engine.events.append(
-                    {
-                        "kind": "no_submission",
-                        "r": engine.round,
-                        "slot": slot,
-                        "alias": engine.aliases[slot],
-                        "text": f"{engine.aliases[slot]} is not here; it passes.",
-                    }
-                )
-                decisions.append(
-                    parse_decision({}, slot, CONFIG, engine, MODULE, "pass")
-                )
+            if slot in raw:
+                try:
+                    decisions.append(
+                        parse_decision(raw[slot], slot, CONFIG, engine, MODULE, src.get(slot, "pass"))
+                    )
+                    continue
+                except ValueError as error:
+                    raw_text = truncate_runes(json.dumps(raw[slot], ensure_ascii=False), 400)
+                    engine.events.append(
+                        {
+                            "kind": "no_submission",
+                            "r": engine.round,
+                            "slot": slot,
+                            "alias": engine.aliases[slot],
+                            "cause": "invalid_action",
+                            "rejection_reason": truncate_runes(str(error), 240),
+                            "raw_reply": raw_text,
+                            "text": f"{engine.aliases[slot]} submitted an invalid decision ({error}); turn rejected.",
+                        }
+                    )
+                    decisions.append(
+                        parse_decision({}, slot, CONFIG, engine, MODULE, "rejected:invalid_action")
+                    )
+                    continue
+
+            if slot in llm_failures:
+                cause, detail = llm_failures[slot]
+                is_rejected = cause in ("parse", "invalid_action")
+                decision_src = f"rejected:{cause}" if is_rejected else f"missed:{cause}"
+                event: dict[str, Any] = {
+                    "kind": "no_submission",
+                    "r": engine.round,
+                    "slot": slot,
+                    "alias": engine.aliases[slot],
+                    "cause": cause,
+                    "text": (
+                        f"{engine.aliases[slot]} reply rejected ({cause})."
+                        if is_rejected
+                        else f"{engine.aliases[slot]} missed the turn ({cause})."
+                    ),
+                }
+                if detail.get("reason"):
+                    event["rejection_reason"] = truncate_runes(str(detail["reason"]), 240)
+                if detail.get("raw_reply"):
+                    event["raw_reply"] = truncate_runes(str(detail["raw_reply"]), 400)
+                engine.events.append(event)
+                decisions.append(parse_decision({}, slot, CONFIG, engine, MODULE, decision_src))
                 continue
-            decisions.append(
-                parse_decision(raw[slot], slot, CONFIG, engine, MODULE, src.get(slot, "pass"))
+
+            engine.events.append(
+                {
+                    "kind": "no_submission",
+                    "r": engine.round,
+                    "slot": slot,
+                    "alias": engine.aliases[slot],
+                    "text": f"{engine.aliases[slot]} submitted no decision; missed turn.",
+                }
             )
+            decisions.append(parse_decision({}, slot, CONFIG, engine, MODULE, "pass"))
 
         settle_round(engine, decisions, CONFIG, MODULE)
         session.decider.capture.record_round(
@@ -549,6 +566,39 @@ async def _broadcast(observations: dict[int, dict]) -> None:
     for slot, websocket in list(session.players.items()):
         with suppress(Exception):
             await websocket.send_json(observations[slot])
+
+
+async def _fail_episode(error: Exception) -> None:
+    """Explicit failure path: preserve trajectory evidence if configured, never write fabricated results."""
+    engine = session.engine
+    session.failed = True
+    session.exit_code = 1
+    session.reason = "failed"
+    session.done = True
+    failure_outcome = {
+        "reason": "failed",
+        "error": str(error),
+        "rounds": engine.round,
+        "scores": [round(score, 3) for score in engine.scores],
+        "llm_requests": session.decider.requests,
+        "names": [truncate_runes(name, 64) for name in PLAYER_NAMES],
+        "aliases": list(engine.aliases),
+    }
+    with suppress(Exception):
+        await asyncio.to_thread(session.decider.capture.finish, failure_outcome)
+    for slot, websocket in list(session.players.items()):
+        with suppress(Exception):
+            await websocket.send_json(
+                {
+                    "type": "final",
+                    "done": True,
+                    "reason": "failed",
+                    "error": str(error),
+                }
+            )
+    if server is not None:
+        server.should_exit = True
+    await asyncio.sleep(0.1)
 
 
 async def _finish(reason: str) -> None:
@@ -665,3 +715,4 @@ def _snapshot() -> dict[str, Any]:
 if __name__ == "__main__":
     server = uvicorn.Server(uvicorn.Config(app, host=GAME_HOST, port=GAME_PORT))
     server.run()
+    raise SystemExit(session.exit_code)

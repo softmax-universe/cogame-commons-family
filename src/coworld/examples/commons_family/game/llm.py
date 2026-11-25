@@ -22,6 +22,7 @@ from coworld.examples.commons_family.game.engine import (
     NOTE_MAX_CHARS,
     PROMPT_MAX_RUNES,
     CommonsConfig,
+    parse_decision,
     truncate_runes,
 )
 from coworld.examples.commons_family.game.modules.base import Module
@@ -238,8 +239,20 @@ def build_transport() -> tuple[object | None, str]:
 # ---------------------------------------------------------------------------
 
 
+def _strip_outer_markdown_fence(raw: str) -> str:
+    """Strip a standard outer Markdown JSON/code fence if present."""
+    stripped = raw.strip()
+    if not stripped.startswith("```"):
+        return raw
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1])
+    return raw
+
+
 def extract_json(raw: str) -> dict | None:
-    """The first balanced `{...}` span, so leading or trailing prose is fine."""
+    """The first balanced `{...}` span, supporting standard outer Markdown JSON fences."""
+    raw = _strip_outer_markdown_fence(raw)
     depth = 0
     start = -1
     in_string = False
@@ -296,6 +309,7 @@ class LlmDecider:
             transport, model = build_transport()
         self.capture = TrainingCapture()
         self.attempts: dict[int, list[dict]] = {}
+        self.last_failures: dict[int, dict[str, Any]] = {}
         self.config = config
         self.prompt_selection = prompt_selection
         self.module = module
@@ -307,7 +321,7 @@ class LlmDecider:
         self._lock = threading.Lock()
         self.checkpoint_models: dict[int, str] = {}
         if self.transport is None:
-            logger.info("no LLM credentials: every prompt seat plays the scripted fallback")
+            logger.info("no LLM credentials configured: prompt seats cannot run without an LLM endpoint")
 
     @property
     def enabled(self) -> bool:
@@ -372,12 +386,17 @@ class LlmDecider:
         if self.checkpoint_models.keys() - requests.keys():
             raise ValueError("Checkpoint routes require a participating prompt seat")
         self.attempts = {}
+        self.last_failures = {}
         self.capture.pending_attempts = self.attempts
         if isinstance(self.transport, MessagesTransport):
             self.transport.attempts = self.attempts
         if not requests:
             return {}
         if not self.enabled:
+            self.last_failures = {
+                slot: {"cause": "disabled", "reason": "no LLM credentials configured"}
+                for slot in requests
+            }
             return {slot: (None, "disabled") for slot in requests}
         slots = sorted(requests)
         with ThreadPoolExecutor(max_workers=max(1, len(slots))) as executor:
@@ -389,52 +408,77 @@ class LlmDecider:
             )
         return dict(zip(slots, answers))
 
+    def _record_failure(self, slot: int, cause: str, reason: str, raw_reply: str = "") -> None:
+        entry: dict[str, Any] = {"cause": cause, "reason": reason}
+        if raw_reply:
+            entry["raw_reply"] = raw_reply
+        with self._lock:
+            self.last_failures[slot] = entry
+
     def _decide_seat(self, slot: int, obs: dict, standing_orders: str, deadline: float) -> tuple[dict | None, str]:
         if slot not in self._systems:
             self._systems[slot] = self.system_prompt(obs, standing_orders)
         system = self._systems[slot]
         user = self.user_message(obs)
         cause = "timeout"
+        last_error = ""
+        last_raw = ""
         for attempt in range(2):
-            text = user if attempt == 0 else f"{user}\n\n{RETRY_HINT}"
+            if attempt == 0:
+                text = user
+            elif last_error:
+                text = f"{user}\n\n{RETRY_HINT} Error: {last_error}"
+            else:
+                text = f"{user}\n\n{RETRY_HINT}"
             try:
                 raw = self._complete(system, text, deadline, slot)
-            except LlmRateBudget:
+            except LlmRateBudget as error:
+                self._record_failure(slot, "rate_budget", str(error))
                 return None, "rate_budget"
-            except LlmTimeout:
+            except LlmTimeout as error:
                 cause = "timeout"
+                last_error = str(error)
                 continue
-            except LlmThrottled:
+            except LlmThrottled as error:
                 cause = "timeout"
+                last_error = str(error)
                 continue
             except LlmTransportError as error:
                 logger.warning("slot %d transport error: %s", slot, error)
                 cause = "transport"
+                last_error = str(error)
                 continue
-            except Exception:
-                # A rejected credential (HTTP 401/403, a botocore auth or
-                # validation ClientError) or a response shape the parser does
-                # not expect is still a transport failure from the seat's point
-                # of view. It is logged with its traceback so a configuration
-                # bug is loud, but it falls back to the scripted baseline: an
-                # exception escaping this batch would otherwise unwind the
-                # round loop and leave the episode with no artifacts at all.
+            except Exception as error:
                 logger.exception("slot %d unclassified LLM failure", slot)
                 cause = "transport"
+                last_error = str(error)
                 continue
             if raw is None:
                 cause = "timeout"
+                last_error = "empty response"
                 continue
+            last_raw = raw
             parsed = extract_json(raw)
             if parsed is None:
                 if self.attempts.get(slot):
                     self.attempts[slot][-1]["rejection_reason"] = "no JSON object"
                 logger.warning("slot %d unusable reply: %r", slot, raw[:200])
                 cause = "parse"
+                last_error = "no JSON object"
+                continue
+            try:
+                parse_decision(parsed, slot, self.config, None, self.module, "llm")
+            except ValueError as error:
+                if self.attempts.get(slot):
+                    self.attempts[slot][-1]["rejection_reason"] = str(error)
+                logger.warning("slot %d invalid decision: %s (raw=%r)", slot, error, raw[:200])
+                cause = "invalid_action"
+                last_error = str(error)
                 continue
             if self.attempts.get(slot):
                 self.attempts[slot][-1]["_proposal"] = parsed
             return parsed, ""
+        self._record_failure(slot, cause, last_error or cause, last_raw)
         return None, cause
 
     def _complete(self, system: str, user: str, deadline: float, slot: int) -> str | None:
@@ -473,7 +517,9 @@ class LlmDecider:
                 continue
             if completion is None:
                 return None
-            return "{" + completion if prefill else completion
+            if prefill:
+                return completion if completion.lstrip().startswith(("{", "```")) else "{" + completion
+            return completion
         raise LlmThrottled("throttled past the ladder")
 
     def _take_budget(self) -> bool:

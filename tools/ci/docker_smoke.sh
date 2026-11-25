@@ -40,9 +40,13 @@
 #                              job loads it in a real browser -- that is the
 #                              only replay in CI that is known to be readable
 #                              by this game's own viewer.
+#   COWORLD_LLM_ENDPOINT       if set, forwarded to the game; if neither this
+#                              nor ANTHROPIC_API_KEY is set, docker_smoke.sh
+#                              starts a local deterministic Messages API fixture
+#                              on the smoke network so prompt seats exercise
+#                              real HTTP inference and action application
 #   ANTHROPIC_API_KEY          if set, forwarded to the game so the LLM path
-#                              is exercised; if unset the game must fall back
-#                              to its scripted baselines and still complete
+#                              is exercised
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -195,11 +199,76 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+using_local_llm_fixture=0
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  if [ -n "${COWORLD_LLM_API_KEY:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_API_KEY=${COWORLD_LLM_API_KEY}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: the LLM path will be exercised"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
   echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  using_local_llm_fixture=1
+  echo "starting local deterministic HTTP Messages API fixture (${prefix}-llm) ..."
+  cat > "${work_dir}/llm_fixture.py" <<'PY'
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+LOG_PATH = "/coworld/llm_requests.jsonl"
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/v1/messages":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        slot = self.headers.get("X-Coworld-Player-Slot", "")
+        action = {
+            "harvest": 1,
+            "clean": 1,
+            "sanction": None,
+            "message": "Deterministic smoke quota: 1 harvest, 1 clean.",
+            "note": "smoke-ok",
+        }
+        with open(LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"slot": slot, "model": body.get("model"), "action": action}) + "\n")
+        payload = json.dumps(
+            {
+                "id": "msg_smoke",
+                "type": "message",
+                "role": "assistant",
+                "model": body.get("model", "deterministic-smoke"),
+                "content": [{"type": "text", "text": json.dumps(action)}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 10},
+            }
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args):
+        pass
+
+
+ThreadingHTTPServer(("0.0.0.0", 8099), Handler).serve_forever()
+PY
+  docker run -d --name "${prefix}-llm" \
+    --network "${network}" --network-alias "${prefix}-llm" \
+    -v "${work_dir}:/coworld:rw" \
+    "${image}" python3 /coworld/llm_fixture.py >/dev/null
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://${prefix}-llm:8099")
+  game_env+=(-e "COWORLD_LLM_MODEL=deterministic-smoke")
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
@@ -271,7 +340,7 @@ echo "all ${seats} player containers exited 0"
 # --------------------------------------------------------------------------
 # Assert the artifacts.
 # --------------------------------------------------------------------------
-if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" <<'PY'
+if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" "${using_local_llm_fixture}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -279,6 +348,7 @@ from pathlib import Path
 work = Path(sys.argv[1])
 seats = int(sys.argv[2])
 require_replay_json = sys.argv[3] not in ("0", "", "false", "no")
+using_local_llm_fixture = sys.argv[4] == "1"
 
 failure = work / "player_failure.json"
 if failure.exists():
@@ -311,12 +381,27 @@ if not replay_path.exists() or replay_path.stat().st_size == 0:
     raise SystemExit("replay missing or empty (COGAME_SAVE_REPLAY_URI was file:///coworld/replay.json)")
 if require_replay_json:
     try:
-        json.loads(replay_path.read_bytes().decode("utf-8"))
+        replay = json.loads(replay_path.read_bytes().decode("utf-8"))
     except Exception as exc:
         raise SystemExit(
             f"replay is not valid UTF-8 JSON: {exc} "
             "(set SMOKE_REQUIRE_REPLAY_JSON=0 for a binary replay format)"
         ) from exc
+    if using_local_llm_fixture:
+        req_log = work / "llm_requests.jsonl"
+        if not req_log.exists() or req_log.stat().st_size == 0:
+            raise SystemExit("local LLM fixture received zero HTTP requests")
+        reqs = [json.loads(line) for line in req_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if len(reqs) < len(replay["rounds"]):
+            raise SystemExit(f"expected at least {len(replay['rounds'])} LLM HTTP requests, got {len(reqs)}")
+        if results.get("llm_requests", 0) < len(replay["rounds"]):
+            raise SystemExit(f"results.llm_requests={results.get('llm_requests')} < {len(replay['rounds'])}")
+        for rec in replay["rounds"]:
+            d0 = rec["decisions"][0]
+            if d0.get("src") != "llm" or d0.get("harvest") != 1 or d0.get("clean") != 1:
+                raise SystemExit(f"slot 0 did not apply HTTP LLM action on round {rec['r']}: {d0!r}")
+        if any(f != 0 for f in results.get("fallbacks", [])):
+            raise SystemExit(f"unexpected fallbacks recorded: {results.get('fallbacks')}")
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "

@@ -95,7 +95,7 @@ async def main() -> None:
     frame = registration()
     logger.info(
         "registering as %s and connecting to %s",
-        frame["scripted"] or ("prompt" if frame["prompt"] else "default steward"),
+        frame["scripted"] or ("prompt" if frame["prompt"] else "unregistered"),
         url,
     )
     try:

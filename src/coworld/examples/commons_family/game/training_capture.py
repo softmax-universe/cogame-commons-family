@@ -104,7 +104,11 @@ class TrainingCapture:
             proposal = attempt.get("_proposal")
             if proposal is None:
                 continue
-            parsed = self.action(parse_decision(proposal, slot, config, state, module, "llm"))
+            try:
+                parsed = self.action(parse_decision(proposal, slot, config, state, module, "llm"))
+            except ValueError as error:
+                attempt["rejection_reason"] = str(error)
+                continue
             attempt["parsed_action"] = parsed
             changed = [
                 key
@@ -139,15 +143,19 @@ class TrainingCapture:
                         selected = attempt["attempt_id"]
                     elif not attempt.get("rejection_reason"):
                         attempt.update(accepted=False, rejection_reason="overridden before round settlement")
-            fallback = (
-                decision.src.startswith("fallback:")
+            rejected_or_missed = (
+                decision.src.startswith(("fallback:", "rejected:", "missed:"))
                 or decision.src == "pass"
                 or (decision.src == "llm" and selected is None)
             )
             if selected is None:
                 origin = (
-                    "fallback"
-                    if fallback
+                    "rejected"
+                    if decision.src.startswith("rejected:")
+                    else "missed"
+                    if decision.src.startswith("missed:") or decision.src == "pass"
+                    else "fallback"
+                    if rejected_or_missed
                     else "teacher"
                     if decision.src.startswith("scripted:") and slot in registered
                     else "unknown"
@@ -158,7 +166,7 @@ class TrainingCapture:
                         attempt_id=selected,
                         policy=decision.src or "missing",
                         origin=origin,
-                        accepted=True,
+                        accepted=not rejected_or_missed,
                         parsed_action=action,
                     )
                 )
@@ -173,9 +181,17 @@ class TrainingCapture:
                 attempts=evidence,
                 selected_attempt_id=selected,
                 executed_action=action,
-                action_status="fallback" if fallback else "accepted",
+                action_status=(
+                    "rejected"
+                    if decision.src.startswith("rejected:")
+                    else "missed"
+                    if decision.src.startswith("missed:") or decision.src == "pass"
+                    else "fallback"
+                    if rejected_or_missed
+                    else "accepted"
+                ),
             )
-            if fallback:
+            if rejected_or_missed:
                 event["fallback_origin"] = "engine-parser-normalization" if decision.src == "llm" else decision.src
             self.decisions.append(copy.deepcopy(event))
         self.pending_attempts = {}

@@ -68,10 +68,18 @@ def test_complete_matched_prompt_games(variant):
                         }
                     )
             proposal = json.loads(bridge.handle({"kind": "teacher"})["response"])
+            if not trace:
+                with pytest.raises(ValueError):
+                    bridge.handle(
+                        {
+                            "kind": "step",
+                            "decision_id": decision["decision_id"],
+                            "response": json.dumps({**proposal, "sanction": slot}),
+                        }
+                    )
             proposal.update(
                 note=f"PRIVATE-SEAT-{slot}:" + "雪" * 220,
                 message="hello " + "雪" * 160,
-                sanction=slot,
             )
             reply = bridge.handle(
                 {
@@ -80,7 +88,6 @@ def test_complete_matched_prompt_games(variant):
                     "response": json.dumps(proposal),
                 }
             )
-            assert reply["action"]["sanction"] is None
             assert len(reply["action"]["note"]) == 200
             if bridge.config.chat_enabled:
                 assert len(reply["action"]["message"]) == bridge.config.chat_max_chars

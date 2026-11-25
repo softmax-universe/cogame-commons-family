@@ -87,21 +87,52 @@ class Decision:
         }
 
 
-def clamp_int(raw: object, low: int, high: int, default: int = 0) -> int:
-    """Coerce anything to an int inside [low, high]; nonsense becomes `default`."""
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return default
-    try:
-        value = int(raw)
-    except (ValueError, OverflowError):
-        return default
-    return min(max(value, low), high)
+def is_missed_turn_src(src: str) -> bool:
+    """True when the seat had no accepted submission for this round."""
+    return src == "pass" or src.startswith(("missed:", "rejected:"))
 
 
-def clamp_color(raw: object, default: str = "red") -> str:
-    if isinstance(raw, str) and raw.strip().lower() in COLORS:
-        return raw.strip().lower()
-    return default
+def parse_int(
+    raw: dict[str, Any],
+    key: str,
+    low: int,
+    high: int,
+    *,
+    required: bool = False,
+    default: int = 0,
+) -> int:
+    """Strictly parse an integer field inside [low, high]."""
+    if key not in raw or raw[key] is None:
+        if required:
+            raise ValueError(f"missing required integer field {key!r}")
+        return default
+    value = raw[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"field {key!r} must be an integer, got {value!r}")
+    if value < low or value > high:
+        raise ValueError(f"field {key!r} must be in {low}..{high}, got {value}")
+    return value
+
+
+def parse_color(
+    raw: dict[str, Any],
+    key: str,
+    *,
+    required: bool = False,
+    default: str = "red",
+) -> str:
+    """Strictly parse a colour enum field."""
+    if key not in raw or raw[key] is None:
+        if required:
+            raise ValueError(f"missing required colour field {key!r}")
+        return default
+    value = raw[key]
+    if not isinstance(value, str):
+        raise ValueError(f"field {key!r} must be one of {COLORS}, got {value!r}")
+    normalized = value.strip().lower()
+    if normalized not in COLORS:
+        raise ValueError(f"field {key!r} must be one of {COLORS}, got {value!r}")
+    return normalized
 
 
 def pro_rata(demands: list[float], available: float) -> list[float]:

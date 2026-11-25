@@ -58,9 +58,11 @@ reply schema, and the manifest's `policies.md` page for the short version.
 ## Where the LLM lives
 
 Registered `PLAYER_PROMPT` policies run in the **game** container. It batches their calls in
-parallel and retries once before falling back to a scripted policy. The bundled player registers
-its policy and spectates. External players may send `decision` messages; submissions received
-before the round settles override that seat's game-container answer.
+parallel and retries once on parse or validation failure, rejecting invalid replies without
+substituting a scripted policy. Missing credentials or transport errors fail the episode
+explicitly without fabricating results. The bundled player registers its policy and spectates.
+External players may send `decision` messages; submissions received before the round settles
+override that seat's game-container answer.
 
 ## Layout
 

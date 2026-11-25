@@ -86,6 +86,18 @@ def test_clean_json_is_taken_as_is():
     assert extract_json('{"harvest": 2, "clean": 1}') == {"harvest": 2, "clean": 1}
 
 
+def test_outer_markdown_json_fence_is_extracted():
+    assert extract_json('```json\n{"harvest": 1, "clean": 1}\n```') == {"harvest": 1, "clean": 1}
+
+
+def test_full_json_reply_under_prefill_is_not_corrupted():
+    transport = StubTransport(['{"harvest": 1, "clean": 1}'])
+    (reply, cause), decider, *_ = decide_one(transport)
+    assert cause == ""
+    assert reply == {"harvest": 1, "clean": 1}
+    assert transport.calls == 1
+
+
 def test_trailing_prose_is_tolerated():
     assert extract_json('{"harvest": 1} — one apple, as agreed.') == {"harvest": 1}
 
@@ -126,15 +138,24 @@ def test_a_clean_reply_is_used_and_the_prefill_brace_is_restored():
     assert transport.bodies[0]["max_tokens"] == 300
 
 
-def test_missing_fields_default_and_out_of_range_fields_clamp():
-    transport = StubTransport(['"harvest": 99, "sanction": 0, "message": "hi"}'])
-    (reply, cause), _, config, state, module, obs = decide_one(transport, sanctions_enabled=True)
-    assert cause == ""
-    decision = parse_decision(reply, 0, config, state, module, "llm")
-    assert decision.harvest == config.effort_budget      # 99 clamped to 3
-    assert decision.clean == 0                           # missing -> 0
-    assert decision.sanction is None                     # slot 0 cannot burn itself
-    assert decision.message == "hi"
+def test_out_of_range_and_illegal_fields_are_rejected_and_retried():
+    transport = StubTransport(['"harvest": 99, "sanction": 0, "message": "hi"}', '"harvest": 2, "clean": 2}'])
+    (reply, cause), decider, *_ = decide_one(transport, sanctions_enabled=True)
+    assert reply is None
+    assert cause == "invalid_action"
+    assert transport.calls == 2
+    assert "Error:" in transport.bodies[1]["messages"][0]["content"]
+    assert "raw_reply" in decider.last_failures[0]
+
+    # Optional fields default cleanly when omitted, while valid core fields pass.
+    ok_transport = StubTransport(['"harvest": 1}'])
+    (ok_reply, ok_cause), _, config, state, module, _ = decide_one(ok_transport, sanctions_enabled=True)
+    assert ok_cause == ""
+    decision = parse_decision(ok_reply, 0, config, state, module, "llm")
+    assert decision.harvest == 1
+    assert decision.clean == 0
+    assert decision.sanction is None
+    assert decision.message is None
 
 
 def test_the_user_message_is_the_observation_with_type_and_round_seconds_dropped():
@@ -149,14 +170,13 @@ def test_the_user_message_is_the_observation_with_type_and_round_seconds_dropped
     assert "take one apple a round" in body["system"]     # standing orders, verbatim
 
 
-def test_an_unusable_reply_is_retried_exactly_once_then_falls_back_to_steward():
+def test_an_unusable_reply_is_retried_exactly_once_then_rejected_with_raw_reply():
     transport = StubTransport(["not json at all", "still not json"])
-    (reply, cause), decider, config, state, module, obs = decide_one(transport)
+    (reply, cause), decider, *_ = decide_one(transport)
     assert reply is None
     assert cause == "parse"
     assert transport.calls == 2, "exactly one retry, no more"
-    fallback = make_baseline(config.fallback_scripted).act(obs)
-    assert "harvest" in fallback
+    assert decider.last_failures[0]["raw_reply"].endswith("still not json")
 
 
 def test_the_retry_carries_the_hint():
@@ -347,25 +367,19 @@ def test_a_disabled_decider_never_touches_its_transport():
     assert decider.decide({0: (obs, "")}, time.monotonic() + 10) == {0: (None, "disabled")}
 
 
-def test_an_episode_with_no_credentials_still_finishes_complete():
+def test_an_episode_with_no_credentials_fails_explicitly():
     from coworld.examples.commons_family import headless  # noqa: PLC0415
-    from coworld.examples.commons_family.game.engine import results  # noqa: PLC0415
 
     config, _, module = setup(rounds=4)
     decider = LlmDecider(config, module, transport=None, model="")
-    state = headless.run_episode(
-        config,
-        headless.build_policies(["steward"] * 6),
-        parallel_seats=True,
-        decider=decider,
-        prompts={0: "take one", 1: "take two"},
-    )
-    payload = results(state, config, module, "complete", ["p"] * 6, decider.requests)
-    assert payload["reason"] == "complete"
-    assert payload["llm_requests"] == 0
-    # Both prompt seats played the scripted fallback, all episode.
-    assert payload["fallbacks"][0] == 4
-    assert payload["fallbacks"][1] == 4
+    with pytest.raises(RuntimeError, match="disabled"):
+        headless.run_episode(
+            config,
+            headless.build_policies(["steward"] * 6),
+            parallel_seats=True,
+            decider=decider,
+            prompts={0: "take one", 1: "take two"},
+        )
 
 
 def test_the_credential_ladder_prefers_the_native_sidecar(monkeypatch):
