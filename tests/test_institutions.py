@@ -58,17 +58,20 @@ def test_sanction_costs_the_payer_and_burns_the_target():
     assert any(event["kind"] == "sanction" for event in state.events)
 
 
-def test_a_sanction_is_dropped_when_the_dial_is_off():
+def test_a_sanction_is_rejected_when_the_dial_is_off():
     config, state, module = setup(sanctions_enabled=False)
-    play(state, config, module, [{"harvest": 1, "sanction": 3}] + [{"harvest": 1}] * 5)
-    assert state.sanctions_given == [0] * 6
-    assert state.scores[3] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="sanctions are disabled"):
+        parse_decision({"harvest": 1, "sanction": 3}, 0, config, state, module, "x")
+    decision = parse_decision({"harvest": 1, "sanction": None}, 0, config, state, module, "x")
+    assert decision.sanction is None
 
 
-@pytest.mark.parametrize("target", [0, 6, -1, 99, "two", None, True])
-def test_a_sanction_is_dropped_unless_it_names_a_real_other_seat(target):
+@pytest.mark.parametrize("target", [0, 6, -1, 99, "two", True])
+def test_a_sanction_is_rejected_unless_it_names_a_real_other_seat(target):
     config, state, module = setup(sanctions_enabled=True)
-    decision = parse_decision({"sanction": target}, 0, config, state, module, "x")
+    with pytest.raises(ValueError):
+        parse_decision({"harvest": 0, "sanction": target}, 0, config, state, module, "x")
+    decision = parse_decision({"harvest": 0, "sanction": None}, 0, config, state, module, "x")
     assert decision.sanction is None
 
 
@@ -100,7 +103,7 @@ def test_public_ledger_carries_the_recent_actions_and_the_counters():
 def test_chat_is_truncated_on_rune_boundaries():
     config, state, module = setup(chat_enabled=True, chat_max_chars=10)
     long_line = "みどり" * 20
-    decision = parse_decision({"message": long_line}, 0, config, state, module, "x")
+    decision = parse_decision({"harvest": 0, "message": long_line}, 0, config, state, module, "x")
     assert decision.message is not None
     assert len(decision.message) == 10
     assert decision.message == long_line[:10]
@@ -111,14 +114,14 @@ def test_chat_is_truncated_on_rune_boundaries():
 def test_a_note_is_truncated_and_never_reaches_the_replay():
     config, state, module = setup()
     long_note = "私" * 400
-    record = play(state, config, module, [{"note": long_note}] + [{}] * 5)
+    record = play(state, config, module, [{"harvest": 0, "note": long_note}] + [{"harvest": 0}] * 5)
     assert len(state.notes[0]) == NOTE_MAX_CHARS
     assert all("note" not in decision for decision in record.decisions)
 
 
 def test_a_note_is_echoed_back_only_to_its_own_seat():
     config, state, module = setup()
-    play(state, config, module, [{"note": "watch Cog-B"}] + [{}] * 5)
+    play(state, config, module, [{"harvest": 0, "note": "watch Cog-B"}] + [{"harvest": 0}] * 5)
     assert observation(state, config, 0, module)["your_note"] == "watch Cog-B"
     assert observation(state, config, 1, module)["your_note"] == ""
 
@@ -126,16 +129,16 @@ def test_a_note_is_echoed_back_only_to_its_own_seat():
 def test_chat_is_visible_in_the_next_round_and_never_inside_its_own():
     config, state, module = setup(chat_enabled=True)
     assert observation(state, config, 1, module)["messages_last_round"] == []
-    play(state, config, module, [{"message": "one each"}] + [{}] * 5)
+    play(state, config, module, [{"harvest": 0, "message": "one each"}] + [{"harvest": 0}] * 5)
     messages = observation(state, config, 1, module)["messages_last_round"]
     assert messages == [{"alias": state.aliases[0], "text": "one each"}]
-    play(state, config, module, [{}] * 6)
+    play(state, config, module, [{"harvest": 0}] * 6)
     assert observation(state, config, 1, module)["messages_last_round"] == []
 
 
 def test_chat_is_dropped_when_the_dial_is_off():
     config, state, module = setup(chat_enabled=False)
-    record = play(state, config, module, [{"message": "hello"}] + [{}] * 5)
+    record = play(state, config, module, [{"harvest": 0, "message": "hello"}] + [{"harvest": 0}] * 5)
     assert record.messages == []
     assert not any(event["kind"] == "chat" for event in state.events)
 

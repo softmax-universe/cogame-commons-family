@@ -71,7 +71,6 @@ def run_episode(
     )
 
     scripted_slots = [slot for slot in range(config.num_agents) if slot not in prompts]
-    fallbacks = {slot: make_baseline(config.fallback_scripted, seed=slot) for slot in prompts}
 
     try:
         with ThreadPoolExecutor(max_workers=max(1, config.num_agents)) as executor:
@@ -100,6 +99,7 @@ def run_episode(
                         raw[slot] = decide(slot)
                         src[slot] = f"scripted:{getattr(policies[slot], 'name', 'baseline')}"
 
+                llm_failures: dict[int, tuple[str, dict[str, Any]]] = {}
                 if prompts and decider is not None:
                     requests = {slot: (observations[slot], prompts[slot]) for slot in prompts}
                     answers = decider.decide(requests, time.monotonic() + config.round_seconds)
@@ -110,27 +110,43 @@ def run_episode(
                             raw[slot] = reply
                             src[slot] = "llm"
                             continue
-                        raw[slot] = fallbacks[slot].act(observations[slot])
-                        src[slot] = f"fallback:{cause}"
-                        state.fallbacks[slot] += 1
-                        state.events.append(
-                            {
-                                "kind": "fallback",
-                                "r": state.round,
-                                "slot": slot,
-                                "alias": state.aliases[slot],
-                                "cause": cause,
-                                "text": (
-                                    f"{state.aliases[slot]} fell back to "
-                                    f"{config.fallback_scripted} — {cause}"
-                                ),
-                            }
-                        )
+                        detail = getattr(decider, "last_failures", {}).get(slot, {})
+                        if cause in ("disabled", "transport"):
+                            reason_text = detail.get("reason") or cause
+                            raise RuntimeError(f"LLM {cause} failure for slot {slot}: {reason_text}")
+                        llm_failures[slot] = (cause, detail)
 
-                decisions = [
-                    parse_decision(raw.get(slot, {}), slot, config, state, module, src.get(slot, "pass"))
-                    for slot in range(config.num_agents)
-                ]
+                decisions = []
+                for slot in range(config.num_agents):
+                    if slot in raw:
+                        decisions.append(
+                            parse_decision(raw[slot], slot, config, state, module, src.get(slot, "pass"))
+                        )
+                        continue
+                    if slot in llm_failures:
+                        cause, detail = llm_failures[slot]
+                        is_rejected = cause in ("parse", "invalid_action")
+                        decision_src = f"rejected:{cause}" if is_rejected else f"missed:{cause}"
+                        event: dict[str, Any] = {
+                            "kind": "no_submission",
+                            "r": state.round,
+                            "slot": slot,
+                            "alias": state.aliases[slot],
+                            "cause": cause,
+                            "text": (
+                                f"{state.aliases[slot]} reply rejected ({cause})."
+                                if is_rejected
+                                else f"{state.aliases[slot]} missed the turn ({cause})."
+                            ),
+                        }
+                        if detail.get("reason"):
+                            event["rejection_reason"] = str(detail["reason"])[:240]
+                        if detail.get("raw_reply"):
+                            event["raw_reply"] = str(detail["raw_reply"])[:400]
+                        state.events.append(event)
+                        decisions.append(parse_decision({}, slot, config, state, module, decision_src))
+                        continue
+                    decisions.append(parse_decision({}, slot, config, state, module, "pass"))
                 settle_round(state, decisions, config, module)
                 if decider is not None and hasattr(decider, "capture"):
                     decider.capture.record_round(

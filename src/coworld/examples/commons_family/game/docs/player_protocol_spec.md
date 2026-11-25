@@ -4,8 +4,7 @@ JSON text frames over the websocket named by `COWORLD_PLAYER_WS_URL`
 (`ws://<game>:8080/player?slot=N&token=T`). One connection per seat.
 
 The player container's only job is to **register a policy**. Every decision is made in the game
-container, so that all six seats' LLM calls can go out as one parallel batch per round and so a
-seat that cannot answer falls back to a scripted baseline instead of silently passing.
+container, so that all six seats' LLM calls can go out as one parallel batch per round.
 
 ## player → game, once, immediately after connect
 
@@ -13,10 +12,9 @@ seat that cannot answer falls back to a scripted baseline instead of silently pa
 {"type": "prompt", "prompt": "<standing orders, at most 1200 runes>", "scripted": "<baseline name or empty>"}
 ```
 
-`scripted` non-empty wins, and names one of
+`scripted` non-empty wins, and must name one of
 `steward, free_rider, cleaner, punisher, reciprocator, deterrable, random`.
-An unknown name, a malformed frame, or no registration within 5 s of connect is treated as
-`{"scripted": "steward"}` — never a disconnect.
+A seat that does not register within 5 s of connect has no registered policy and records missed turns unless it sends `decision` frames over its websocket.
 
 The reference player (`/bin/commons-family-player`) sends `PLAYER_PROMPT` and `PLAYER_SCRIPTED`
 from its environment and then spectates.
@@ -100,16 +98,15 @@ choose their own actions over the same observation and decision frames.
 
 | field | modules | type | range | invalid → |
 | --- | --- | --- | --- | --- |
-| `harvest` | `cleanup`, `harvest` | int | 0..3 | 0 |
-| `clean` | `cleanup` | int | 0..3, `harvest + clean ≤ 3` | 0 / reduced first |
-| `patch` | `harvest` | int | 0..5 | 0 |
-| `eat` | `allelopathic`, `mushrooms` | int | 0..3 | 0 |
-| `eat_color` | `allelopathic`, `mushrooms` | enum | `red\|green\|blue` | `red` |
-| `plant` | `allelopathic` | int | 0..3, `eat + plant ≤ 3` | 0 / reduced first |
-| `plant_color` | `allelopathic` | enum | `red\|green\|blue` | `eat_color` |
-| `sanction` | all | int or null | `0..5`, never yourself | null |
-| `message` | all | text | ≤ 140 runes | truncated |
-| `note` | all | text | ≤ 200 runes | truncated |
+| `harvest` | `cleanup`, `harvest` | int | 0..3 | rejected |
+| `clean` | `cleanup` | int | 0..3, `harvest + clean ≤ 3` | rejected |
+| `patch` | `harvest` | int | 0..5 | rejected |
+| `eat` | `allelopathic`, `mushrooms` | int | 0..3 | rejected |
+| `eat_color` | `allelopathic`, `mushrooms` | enum | `red\|green\|blue` | rejected |
+| `plant` | `allelopathic` | int | 0..3, `eat + plant ≤ 3` | rejected |
+| `plant_color` | `allelopathic` | enum | `red\|green\|blue` | rejected |
+| `sanction` | all | int or null | `0..5`, never yourself (when enabled) | rejected |
+| `message` | all | text or null | ≤ 140 runes | truncated (non-string rejected) |
+| `note` | all | text or null | ≤ 200 runes | truncated (non-string rejected) |
 
-Every free-text field is truncated on **rune** boundaries, never byte boundaries, and `note` is
-private: it is echoed back only to its own seat and never written to the replay.
+Invalid or unparseable model replies are retried once with the validation error and, if still invalid, rejected with no synthesized fallback action. Missing credentials or transport failures fail the episode explicitly without fabricating `results.json`. Every free-text field is truncated on **rune** boundaries, never byte boundaries, and `note` is private: it is echoed back only to its own seat and never written to the replay.

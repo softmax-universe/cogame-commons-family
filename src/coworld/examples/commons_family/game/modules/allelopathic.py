@@ -16,8 +16,8 @@ from coworld.examples.commons_family.game.modules.base import (
     COLORS,
     Decision,
     Module,
-    clamp_color,
-    clamp_int,
+    parse_color,
+    parse_int,
     pro_rata,
 )
 
@@ -35,13 +35,17 @@ class AllelopathicModule(Module):
 
     def parse_decision(self, raw: object, slot: int, config: Any, state: dict) -> Decision:
         if not isinstance(raw, dict):
-            return Decision()
-        eat = clamp_int(raw.get("eat", 0), 0, config.effort_budget)
-        plant = clamp_int(raw.get("plant", 0), 0, config.effort_budget)
-        eat_color = clamp_color(raw.get("eat_color"), "red")
-        plant_color = clamp_color(raw.get("plant_color"), eat_color)
+            raise ValueError("decision must be a JSON object")
+        if "eat" not in raw and "plant" not in raw:
+            raise ValueError("allelopathic decision must include 'eat' or 'plant'")
+        eat = parse_int(raw, "eat", 0, config.effort_budget, default=0)
+        plant = parse_int(raw, "plant", 0, config.effort_budget, default=0)
         if eat + plant > config.effort_budget:
-            plant = max(0, config.effort_budget - eat)
+            raise ValueError(
+                f"eat ({eat}) + plant ({plant}) exceeds effort_budget ({config.effort_budget})"
+            )
+        eat_color = parse_color(raw, "eat_color", required=(eat > 0), default="red")
+        plant_color = parse_color(raw, "plant_color", required=(plant > 0), default=eat_color)
         return Decision(eat=eat, eat_color=eat_color, plant=plant, plant_color=plant_color)
 
     def resolve(
@@ -184,7 +188,8 @@ class AllelopathicModule(Module):
             f'"plant": <int 0..{cap}>, "plant_color": "red|green|blue", '
             '"sanction": <cog slot int or null>, "message": "<one public line>", '
             '"note": "<private reminder to yourself>"}'
-            f" — eat + plant must not exceed {cap}."
+            f" — eat + plant must not exceed {cap}.\n"
+            'Example: {"eat": 1, "eat_color": "red", "plant": 1, "plant_color": "red", "sanction": null, "message": "Planting red.", "note": "Coordinate on one color."}'
         )
 
     def rules_text(self, config: Any) -> str:

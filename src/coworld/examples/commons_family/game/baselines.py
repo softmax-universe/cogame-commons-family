@@ -419,9 +419,7 @@ DEFAULT_BASELINE = "steward"
 
 
 def make_baseline(name: str, seed: int = 0) -> Baseline:
-    """Instantiate a baseline by registry name; an unknown name is the default.
-
-    Unknown names degrade rather than raise: a mistyped `PLAYER_SCRIPTED` must
-    seat a playing cog, not kill the episode.
-    """
-    return BASELINES.get(name, BASELINES[DEFAULT_BASELINE])(seed=seed)
+    """Instantiate a baseline by explicit registry name."""
+    if name not in BASELINES:
+        raise ValueError(f"unknown baseline {name!r}; known: {sorted(BASELINES)}")
+    return BASELINES[name](seed=seed)
