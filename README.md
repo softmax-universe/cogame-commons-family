@@ -65,4 +65,4 @@ upload coworld → put secret, in that order, and uploads `release-result` as an
 
 ### Private checkpoint gateway authentication
 
-For a direct private Messages gateway, set `COWORLD_LLM_ENDPOINT` and supply its credential in `COWORLD_LLM_API_KEY`. The native game sends that key as `x-api-key`; it does not put it in request bodies or trajectory captures. Omit the variable for the hosted sidecar's existing `sidecar` credential. Immutable checkpoint player routing, ordinary rounds and retry/fallback behavior are unchanged. A local direct-gateway result is not a platform receipt or production route registration.
+For a direct private Messages gateway, set `COWORLD_LLM_ENDPOINT` and supply its credential in `COWORLD_LLM_API_KEY`. The native game sends that key as `x-api-key`; it does not put it in request bodies or trajectory captures. Omit the variable for the hosted sidecar's existing `sidecar` credential. Immutable checkpoint player routing, ordinary rounds, and single-call native model outcome behavior are unchanged. A local direct-gateway result is not a platform receipt or production route registration.

@@ -58,10 +58,12 @@ reply schema, and the manifest's `policies.md` page for the short version.
 ## Where the LLM lives
 
 Registered `PLAYER_PROMPT` policies run in the **game** container. It batches their calls in
-parallel and retries once on parse or validation failure, rejecting invalid replies without
-substituting a scripted policy. Missing credentials or transport errors fail the episode
-explicitly without fabricating results. The bundled player registers its policy and spectates.
-External players may send `decision` messages; submissions received before the round settles
+parallel with a single model call per prompt seat and no hidden retries or scripted fallbacks.
+Malformed or illegal replies fail the episode explicitly as an unscored `player_error` attributed
+to the failing seat; missing credentials, HTTP/transport failures, timeouts, throttling, or
+missing/disconnected seats fail the episode explicitly as an unscored `episode_inconclusive`
+without fabricating results. The bundled player registers its policy and spectates.
+External players may send `decision` messages; valid submissions received before the round settles
 override that seat's game-container answer.
 
 ## Layout
@@ -71,7 +73,7 @@ game/engine.py            the round loop, the institutions, the ledger, the repl
 game/modules/base.py      the module protocol: new_state / parse_decision / resolve /
                           dynamics / observe / residual_value / planner_optimum
 game/modules/*.py         the four physics
-game/llm.py               the LLM seat: credential ladder, one parallel batch, retry once
+game/llm.py               the LLM seat: credential ladder, one parallel batch, one call per seat
 game/baselines.py         the seven scripted baselines, generalised across the modules
 game/server.py            the Coworld game-container contract
 player/player.py          registers a policy, then spectates

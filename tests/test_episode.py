@@ -52,6 +52,7 @@ def load_server(tmp_path: Path, game_config: dict, monkeypatch):
     monkeypatch.setenv("COGAME_CONFIG_URI", config_path.as_uri())
     monkeypatch.setenv("COGAME_RESULTS_URI", (work / "results.json").as_uri())
     monkeypatch.setenv("COGAME_SAVE_REPLAY_URI", (work / "replay.json").as_uri())
+    monkeypatch.setenv("COGAME_PLAYER_FAILURE_URI", (work / "player_failure.json").as_uri())
     monkeypatch.setenv("COMMONS_FAMILY_POST_GAME_LINGER_SECONDS", "0")
     monkeypatch.setenv("COMMONS_FAMILY_POST_GAME_MAX_LINGER_SECONDS", "0")
 
@@ -266,20 +267,23 @@ def test_no_seat_connecting_settles_no_players_with_zero_scores(tmp_path, monkey
     assert (work / "replay.json").exists()
 
 
-def test_a_seat_that_never_connects_passes_and_is_flagged(tmp_path, monkeypatch):
+def test_a_seat_that_never_connects_fails_as_episode_inconclusive(tmp_path, monkeypatch):
     module, work = load_server(tmp_path, base_game_config(), monkeypatch)
     seat_all(module, ["steward"] * 6)
     module.session.connected_ever.discard(5)
     module.session.registrations.pop(5, None)
     asyncio.run(module._play_game())
 
-    payload = json.loads((work / "results.json").read_bytes().decode("utf-8"))
-    assert payload["reason"] == "complete"
-    assert payload["disconnected"] == [False] * 5 + [True]
-    assert payload["scores"][5] == pytest.approx(0.0)
-    replay = json.loads((work / "replay.json").read_bytes().decode("utf-8"))
-    assert any(event["kind"] == "no_submission" and event["slot"] == 5
-               for event in replay["events"])
+    assert module.session.failed is True
+    assert module.session.exit_code == 1
+    assert not (work / "results.json").exists()
+    assert not (work / "replay.json").exists()
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert failure == {
+        "kind": "episode_inconclusive",
+        "failed_policy_index": 5,
+        "message": "Player did not connect",
+    }
 
 
 def test_a_player_sent_decision_overrides_the_game_side_one(tmp_path, monkeypatch):
@@ -303,7 +307,7 @@ def test_a_player_sent_decision_overrides_the_game_side_one(tmp_path, monkeypatc
 
 
 def test_a_transport_that_raises_fails_explicitly_without_fabricating_results(tmp_path, monkeypatch):
-    """Transport/credential failures must fail explicitly and never fabricate results.json."""
+    """Transport/credential failures must emit episode_inconclusive and never fabricate results.json."""
     from urllib.error import HTTPError  # noqa: PLC0415
 
     module, work = load_server(tmp_path, base_game_config(rounds=3), monkeypatch)
@@ -323,10 +327,14 @@ def test_a_transport_that_raises_fails_explicitly_without_fabricating_results(tm
     assert module.session.exit_code == 1
     assert not (work / "results.json").exists()
     assert not (work / "replay.json").exists()
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert failure["kind"] == "episode_inconclusive"
+    assert failure["failed_policy_index"] == 0
+    assert "401" not in failure["message"]
 
 
 def test_missing_credentials_fails_explicitly_without_fabricating_results(tmp_path, monkeypatch):
-    """A prompt seat with no LLM endpoint/credentials must fail explicitly without results.json."""
+    """A prompt seat with no LLM endpoint/credentials must emit episode_inconclusive without results.json."""
     module, work = load_server(tmp_path, base_game_config(rounds=3), monkeypatch)
     seat_all(module, ["steward", "cleaner", "punisher", "free_rider", "random", "steward"])
     module.session.registrations[0] = {"prompt": "take one apple", "scripted": ""}
@@ -336,34 +344,44 @@ def test_missing_credentials_fails_explicitly_without_fabricating_results(tmp_pa
     assert module.session.exit_code == 1
     assert not (work / "results.json").exists()
     assert not (work / "replay.json").exists()
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert failure == {
+        "kind": "episode_inconclusive",
+        "failed_policy_index": 0,
+        "message": "Model inference unavailable",
+    }
 
 
-def test_rejected_model_reply_records_no_submission_without_scripted_fallback(tmp_path, monkeypatch):
-    """Unparseable or illegal model replies are rejected as no_submission, never replaced by steward."""
+def test_rejected_model_reply_fails_as_player_error_on_single_call(tmp_path, monkeypatch):
+    """Unparseable or illegal model replies fail explicitly as unscored player_error on single call."""
     module, work = load_server(tmp_path, base_game_config(rounds=2), monkeypatch)
     seat_all(module, ["steward", "cleaner", "punisher", "free_rider", "random", "steward"])
-    module.session.registrations[0] = {"prompt": "take one apple", "scripted": ""}
+    module.session.registrations[2] = {"prompt": "take one apple", "scripted": ""}
 
     class BadReplyTransport:
+        def __init__(self):
+            self.calls = 0
+
         def complete(self, body, timeout, slot):
+            self.calls += 1
             return '{"harvest": 99, "clean": 2}'
 
-    module.session.decider.transport = BadReplyTransport()
+    transport = BadReplyTransport()
+    module.session.decider.transport = transport
     module.session.decider.model = "deterministic-test"
     asyncio.run(module._play_game())
 
-    payload = json.loads((work / "results.json").read_bytes().decode("utf-8"))
-    replay = json.loads((work / "replay.json").read_bytes().decode("utf-8"))
-    assert payload["reason"] == "complete"
-    assert payload["fallbacks"] == [0] * 6
-    assert payload["scores"][0] == pytest.approx(0.0)
-    for record in replay["rounds"]:
-        d0 = record["decisions"][0]
-        assert d0["src"] == "rejected:invalid_action"
-        assert d0["harvest"] == 0 and d0["clean"] == 0
-    rejected_events = [e for e in replay["events"] if e["kind"] == "no_submission" and e["slot"] == 0]
-    assert len(rejected_events) == 2
-    assert all('"harvest": 99' in e.get("raw_reply", "") for e in rejected_events)
+    assert transport.calls == 1
+    assert module.session.failed is True
+    assert module.session.exit_code == 1
+    assert not (work / "results.json").exists()
+    assert not (work / "replay.json").exists()
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert failure == {
+        "kind": "player_error",
+        "failed_policy_index": 2,
+        "message": "Player submitted an invalid decision",
+    }
 
 
 def test_ordinary_model_calls_local_deterministic_http_and_applies_action_against_baselines(
@@ -526,16 +544,191 @@ def test_hosted_inference_needs_no_provider_secret():
     assert "secrets.ANTHROPIC_API_KEY" not in workflow
 
 
-def test_an_unregistered_seat_records_missed_turn_instead_of_steward(tmp_path, monkeypatch):
+def test_an_unregistered_seat_with_no_decision_fails_as_episode_inconclusive(tmp_path, monkeypatch):
+    """An external learner seat that never submits a decision fails explicitly without pass substitution."""
     module, work = load_server(tmp_path, base_game_config(rounds=2), monkeypatch)
-    module.session.connected_ever.update(range(6))     # connected, never registered
+    seat_all(module, ["steward"] * 6)
+    module.session.registrations.pop(3, None)
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, msg):
+            self.sent.append(msg)
+
+    sockets = {slot: FakeSocket() for slot in range(6)}
+    module.session.players.update(sockets)
     asyncio.run(module._play_game())
 
-    replay = json.loads((work / "replay.json").read_bytes().decode("utf-8"))
-    assert all(
-        decision["src"] == "pass"
-        for decision in replay["rounds"][0]["decisions"]
+    assert module.session.failed is True
+    assert module.session.exit_code == 1
+    assert not (work / "results.json").exists()
+    assert not (work / "replay.json").exists()
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert failure == {
+        "kind": "episode_inconclusive",
+        "failed_policy_index": 3,
+        "message": "Player did not submit a decision",
+    }
+    for sock in sockets.values():
+        finals = [m for m in sock.sent if m.get("type") == "final"]
+        assert finals == [{"type": "final", "done": True, "reason": "failed"}]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_kind", "failing_slot"),
+    [
+        ("http_503", "episode_inconclusive", 1),
+        ("malformed_text", "player_error", 2),
+        ("illegal_action", "player_error", 4),
+    ],
+)
+def test_local_http_fixture_native_failure_outcomes_preserve_private_trace_without_broadcasting_errors(
+    tmp_path, monkeypatch, mode, expected_kind, failing_slot
+):
+    """Real local HTTP fixture: 503 -> episode_inconclusive; malformed/illegal -> player_error on actual slot."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    received = []
+    secret_sentinel = f"PRIVATE-SECRET-{mode}-DO-NOT-BROADCAST"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            slot = int(self.headers["X-Coworld-Player-Slot"])
+            received.append((self.path, slot, body["model"]))
+            if mode == "http_503":
+                payload = json.dumps({"error": {"message": secret_sentinel}}).encode("utf-8")
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            if mode == "malformed_text":
+                text = f"not json at all {secret_sentinel}"
+            else:
+                text = json.dumps({"harvest": 99, "clean": 2, "note": secret_sentinel})
+            payload = json.dumps(
+                {"id": "msg_bad", "model": body["model"], "content": [{"type": "text", "text": text}]}
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    http_srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=http_srv.serve_forever, daemon=True)
+    thread.start()
+    traj_path = tmp_path / f"private-{mode}.jsonl"
+    try:
+        monkeypatch.setenv("COWORLD_LLM_ENDPOINT", f"http://127.0.0.1:{http_srv.server_port}")
+        monkeypatch.setenv("COWORLD_LLM_MODEL", "deterministic-local")
+        monkeypatch.setenv("COGAME_SAVE_TRAJECTORY_URI", traj_path.as_uri())
+        monkeypatch.setenv("COWORLD_EPISODE_ID", f"ep-{mode}")
+        monkeypatch.setenv("COWORLD_GAME_VERSION", "0.1.10-test")
+        monkeypatch.setenv("COWORLD_SOURCE_REVISION", "test-rev")
+        module, work = load_server(tmp_path, base_game_config(rounds=3), monkeypatch)
+        seat_all(module, ["steward"] * 6)
+        module.session.registrations[failing_slot] = {
+            "prompt": "Take 1 and clean 1.",
+            "scripted": "",
+        }
+
+        class FakeSocket:
+            def __init__(self):
+                self.sent = []
+
+            async def send_json(self, msg):
+                self.sent.append(msg)
+
+        sockets = {slot: FakeSocket() for slot in range(6)}
+        module.session.players.update(sockets)
+        asyncio.run(module._play_game())
+    finally:
+        http_srv.shutdown()
+        http_srv.server_close()
+        thread.join(timeout=5)
+
+    assert len(received) == 1, "one call per prompt seat, zero retries"
+    assert received[0][1] == failing_slot
+    assert module.session.failed is True
+    assert module.session.exit_code == 1
+    assert not (work / "results.json").exists()
+    assert not (work / "replay.json").exists()
+
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert set(failure) == {"kind", "failed_policy_index", "message"}
+    assert failure["kind"] == expected_kind
+    assert failure["failed_policy_index"] == failing_slot
+    assert secret_sentinel not in failure["message"]
+
+    # Private error details must NOT be broadcast to any player socket.
+    for sock in sockets.values():
+        finals = [m for m in sock.sent if m.get("type") == "final"]
+        assert finals == [{"type": "final", "done": True, "reason": "failed"}]
+        assert secret_sentinel not in json.dumps(sock.sent)
+
+    # Private trace IS preserved cleanly.
+    rows = [json.loads(line) for line in traj_path.read_text(encoding="utf-8").splitlines()]
+    episode = rows[-1]
+    assert episode["event_type"] == "episode"
+    assert episode["status"] == "failed"
+    assert episode["outcome"]["failure_kind"] == expected_kind
+    assert episode["outcome"]["failed_policy_index"] == failing_slot
+    unsettled = episode["outcome"]["unsettled_model_attempts"][str(failing_slot)]
+    assert len(unsettled) == 1
+    assert secret_sentinel in unsettled[0]["raw_response"]
+    if mode == "http_503":
+        assert unsettled[0]["http_status"] == 503
+        assert unsettled[0]["rejection_reason"] == "HTTP 503"
+    else:
+        assert unsettled[0]["http_status"] == 200
+        assert unsettled[0]["rejection_reason"]
+
+
+def test_illegal_external_player_decision_fails_as_player_error_without_substitution(tmp_path, monkeypatch):
+    """An external learner sending an illegal decision fails as player_error on its slot."""
+    module, work = load_server(
+        tmp_path, base_game_config(rounds=2, min_round_seconds=0.3), monkeypatch
     )
+    seat_all(module, ["steward"] * 6)
+    module.session.registrations.pop(4, None)
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send_json(self, msg):
+            self.sent.append(msg)
+
+    sockets = {slot: FakeSocket() for slot in range(6)}
+    module.session.players.update(sockets)
+
+    async def drive() -> None:
+        episode = asyncio.create_task(module._play_game())
+        await asyncio.sleep(0.05)
+        module.session.player_decisions[4] = {"type": "decision", "harvest": 99, "clean": 0}
+        await episode
+
+    asyncio.run(drive())
+
+    assert module.session.failed is True
+    assert module.session.exit_code == 1
+    assert not (work / "results.json").exists()
+    assert not (work / "replay.json").exists()
+    failure = json.loads((work / "player_failure.json").read_text(encoding="utf-8"))
+    assert failure == {
+        "kind": "player_error",
+        "failed_policy_index": 4,
+        "message": "Player submitted an invalid decision",
+    }
 
 
 # ---------------------------------------------------------------------------

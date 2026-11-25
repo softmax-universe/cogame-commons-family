@@ -1,10 +1,9 @@
 """The LLM decision path, with a stubbed transport. No network, ever.
 
-Covers the seven behaviours the design pins: clean JSON, JSON with trailing
-prose, prose before the brace, missing fields defaulted, an out-of-range field
-clamped, a timeout triggering exactly ONE retry and then the `steward` fallback
-with the right cause, the batch issuing all six requests concurrently, and the
-no-credentials path making zero network calls.
+Covers clean JSON, JSON with trailing prose, prose before the brace, strict
+validation without retries or scripted fallbacks, single-call timeout/throttle/
+transport failure reporting, parallel batch dispatch across all six seats, and
+the no-credentials path making zero network calls.
 """
 
 from __future__ import annotations
@@ -138,13 +137,13 @@ def test_a_clean_reply_is_used_and_the_prefill_brace_is_restored():
     assert transport.bodies[0]["max_tokens"] == 300
 
 
-def test_out_of_range_and_illegal_fields_are_rejected_and_retried():
-    transport = StubTransport(['"harvest": 99, "sanction": 0, "message": "hi"}', '"harvest": 2, "clean": 2}'])
+def test_out_of_range_and_illegal_fields_are_rejected_without_retry():
+    transport = StubTransport(['"harvest": 99, "sanction": 0, "message": "hi"}', '"harvest": 1, "clean": 1}'])
     (reply, cause), decider, *_ = decide_one(transport, sanctions_enabled=True)
     assert reply is None
     assert cause == "invalid_action"
-    assert transport.calls == 2
-    assert "Error:" in transport.bodies[1]["messages"][0]["content"]
+    assert transport.calls == 1
+    assert decider.requests == 1
     assert "raw_reply" in decider.last_failures[0]
 
     # Optional fields default cleanly when omitted, while valid core fields pass.
@@ -170,53 +169,39 @@ def test_the_user_message_is_the_observation_with_type_and_round_seconds_dropped
     assert "take one apple a round" in body["system"]     # standing orders, verbatim
 
 
-def test_an_unusable_reply_is_retried_exactly_once_then_rejected_with_raw_reply():
-    transport = StubTransport(["not json at all", "still not json"])
+def test_an_unusable_reply_is_rejected_on_single_call_with_raw_reply():
+    transport = StubTransport(["not json at all", '{"harvest": 1}'])
     (reply, cause), decider, *_ = decide_one(transport)
     assert reply is None
     assert cause == "parse"
-    assert transport.calls == 2, "exactly one retry, no more"
-    assert decider.last_failures[0]["raw_reply"].endswith("still not json")
+    assert transport.calls == 1, "one call per prompt seat, no hidden retries"
+    assert decider.last_failures[0]["raw_reply"].endswith("not json at all")
 
 
-def test_the_retry_carries_the_hint():
-    transport = StubTransport(["prose", '"harvest": 1}'])
-    (reply, cause), *_ = decide_one(transport)
-    assert cause == ""
-    assert reply == {"harvest": 1}
-    assert "Reply with ONE JSON object" in transport.bodies[1]["messages"][0]["content"]
-
-
-def test_a_timeout_is_retried_once_and_reported_as_timeout():
-    transport = StubTransport([LlmTimeout("slow"), LlmTimeout("slow")])
+def test_a_timeout_makes_one_call_and_is_reported_as_timeout():
+    transport = StubTransport([LlmTimeout("slow"), '"harvest": 1}'])
     (reply, cause), *_ = decide_one(transport)
     assert (reply, cause) == (None, "timeout")
-    assert transport.calls == 2
+    assert transport.calls == 1
 
 
-def test_a_transport_error_is_reported_as_transport():
-    transport = StubTransport([LlmTransportError("dns"), LlmTransportError("dns")])
+def test_a_transport_error_makes_one_call_and_is_reported_as_transport():
+    transport = StubTransport([LlmTransportError("dns"), '"harvest": 1}'])
     (reply, cause), *_ = decide_one(transport)
     assert (reply, cause) == (None, "transport")
+    assert transport.calls == 1
 
 
-def test_an_unclassified_transport_exception_degrades_the_seat_rather_than_escaping():
-    """A rejected credential must cost one seat one round, not the episode.
-
-    `MessagesTransport` re-raises any non-429/529 `HTTPError`, so a 401 (or a
-    response shape the parser does not expect) arrives here unclassified. It
-    used to travel out of the batch, through `decide`, through the server's
-    `to_thread` and into `_play_game`, whose task nobody awaits: no artifacts,
-    no exit.
-    """
+def test_an_unclassified_transport_exception_is_reported_without_retry():
+    """`MessagesTransport` re-raises non-429/529 `HTTPError` (e.g. 503, 401)."""
     from urllib.error import HTTPError  # noqa: PLC0415
 
-    error = HTTPError("https://api.anthropic.com/v1/messages", 401,
-                      "Unauthorized", {}, None)
-    transport = StubTransport([error, error])
+    error = HTTPError("https://api.anthropic.com/v1/messages", 503,
+                      "Service Unavailable", {}, None)
+    transport = StubTransport([error, '"harvest": 1}'])
     (reply, cause), decider, *_ = decide_one(transport)
     assert (reply, cause) == (None, "transport")
-    assert transport.calls == 2                    # the retry, and no more
+    assert transport.calls == 1
 
 
 def test_an_unclassified_exception_in_one_seat_does_not_stop_the_batch():
@@ -245,36 +230,29 @@ def test_an_unclassified_exception_in_one_seat_does_not_stop_the_batch():
     assert all(cause in ("", "transport") for _, cause in answers.values())
 
 
-def test_throttling_walks_the_ladder_inside_the_round_and_then_gives_up():
-    transport = StubTransport([LlmThrottled("429")])
+def test_throttling_fails_immediately_on_single_call_without_sleep_ladder():
+    transport = StubTransport([LlmThrottled("429"), '"harvest": 1}'])
+    started = time.monotonic()
     (reply, cause), decider, *_ = decide_one(transport)
-    assert (reply, cause) == (None, "timeout")
-    # Four calls per attempt (the ladder is three sleeps), two attempts.
-    assert transport.calls == 8
-    assert decider.requests == 8
+    assert (reply, cause) == (None, "throttled")
+    assert transport.calls == 1
+    assert decider.requests == 1
+    assert time.monotonic() - started < 1.0
 
 
-def test_the_round_deadline_stops_the_ladder():
-    transport = StubTransport([LlmThrottled("429")])
+def test_expired_round_deadline_fails_before_calling_transport():
+    transport = StubTransport(['"harvest": 1}'])
     config, state, module = setup()
     decider = LlmDecider(config, module, transport=transport, model="claude-haiku-4-5")
     obs = observation(state, config, 0, module)
-    started = time.monotonic()
-    answers = decider.decide({0: (obs, "")}, started + 0.2)
+    answers = decider.decide({0: (obs, "")}, time.monotonic() - 0.1)
     assert answers[0] == (None, "timeout")
-    assert time.monotonic() - started < 5.0
+    assert transport.calls == 0
 
 
-def test_six_throttled_seats_cannot_outrun_the_rolling_budget():
-    """The ladder's worst case is 8 requests a seat; the budget is the ceiling.
-
-    Four requests per attempt and two attempts is up to 48 requests in one
-    round with six throttled seats. `llm_max_requests_per_minute` is a rolling
-    60 s budget shared by every seat, and retries and ladder steps draw from
-    it, so that is what bounds the rate — not the per-round arithmetic.
-    """
+def test_six_throttled_seats_respect_the_rolling_budget_with_one_call_each():
     transport = StubTransport([LlmThrottled("429")])
-    config, state, module = setup(llm_max_requests_per_minute=20)
+    config, state, module = setup(llm_max_requests_per_minute=4)
     decider = LlmDecider(config, module, transport=transport, model="claude-haiku-4-5")
     requests = {
         slot: (observation(state, config, slot, module), "")
@@ -282,12 +260,12 @@ def test_six_throttled_seats_cannot_outrun_the_rolling_budget():
     }
     answers = decider.decide(requests, time.monotonic() + 1.5)
     assert sorted(answers) == list(range(6))
-    assert all(cause in ("timeout", "rate_budget") for _, cause in answers.values())
-    assert decider.requests <= 20
-    assert transport.calls <= 20
+    assert all(cause in ("throttled", "rate_budget") for _, cause in answers.values())
+    assert decider.requests == 4
+    assert transport.calls == 4
 
 
-def test_the_rate_budget_falls_the_seat_back_rather_than_waiting():
+def test_the_rate_budget_reports_rate_budget_rather_than_waiting():
     transport = StubTransport(['"harvest": 1}'])
     config, state, module = setup(llm_max_requests_per_minute=1)
     decider = LlmDecider(config, module, transport=transport, model="claude-haiku-4-5")

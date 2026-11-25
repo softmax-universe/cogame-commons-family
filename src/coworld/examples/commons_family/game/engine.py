@@ -80,6 +80,37 @@ EVENT_KINDS = (
 #: The only legal `results.reason` values. The game emits nothing else.
 END_REASONS = ("complete", "deadline", "no_players")
 
+#: The only legal native Coworld `GamePlayerFailure.kind` values.
+FAILURE_KINDS = ("player_error", "episode_inconclusive")
+
+
+class EpisodeFailure(RuntimeError):
+    """Explicit unscored native episode failure with Coworld attribution."""
+
+    def __init__(
+        self,
+        kind: str,
+        slot: int,
+        public_message: str,
+        private_detail: str = "",
+    ) -> None:
+        if kind not in FAILURE_KINDS:
+            raise ValueError(f"illegal episode failure kind {kind!r}")
+        if slot < 0:
+            raise ValueError(f"failed_policy_index must be >= 0, got {slot}")
+        self.kind = kind
+        self.slot = slot
+        self.public_message = public_message
+        self.private_detail = private_detail or public_message
+        super().__init__(self.private_detail)
+
+    def to_public_envelope(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "failed_policy_index": self.slot,
+            "message": self.public_message,
+        }
+
 
 def truncate_runes(text: object, cap: int) -> str:
     """Trim free text to `cap` RUNES, never bytes.

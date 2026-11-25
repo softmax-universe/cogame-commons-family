@@ -32,6 +32,7 @@ from coworld.examples.commons_family.game.engine import (
     PLAYER_PROTOCOL,
     PROMPT_MAX_RUNES,
     CommonsConfig,
+    EpisodeFailure,
     GameState,
     module_for,
     new_game,
@@ -73,6 +74,7 @@ REGISTRATION_GRACE_SECONDS = 5.0
 RAW_CONFIG: dict[str, Any] = json.loads(read_data(os.environ["COGAME_CONFIG_URI"]))
 RESULTS_URI = os.environ["COGAME_RESULTS_URI"]
 REPLAY_URI = os.environ["COGAME_SAVE_REPLAY_URI"]
+PLAYER_FAILURE_URI = os.environ.get("COGAME_PLAYER_FAILURE_URI", "").strip()
 
 TOKENS: list[str] = list(RAW_CONFIG.get("tokens") or [])
 PLAYER_NAMES: list[str] = [
@@ -378,6 +380,13 @@ async def _run_episode() -> str:
         _policy_for(slot)
     for slot in range(CONFIG.num_agents):
         engine.disconnected[slot] = slot not in session.connected_ever
+        if engine.disconnected[slot]:
+            raise EpisodeFailure(
+                "episode_inconclusive",
+                slot,
+                "Player did not connect",
+                f"seat {slot} never connected before episode start",
+            )
 
     engine.events.append(
         {
@@ -467,17 +476,27 @@ async def _run_episode() -> str:
         else:
             answers = {}
         session.decider.capture.parse_model_replies(answers, CONFIG, engine, MODULE)
-        llm_failures: dict[int, tuple[str, dict[str, Any]]] = {}
-        for slot, (reply, cause) in answers.items():
+        for slot in sorted(answers):
+            reply, cause = answers[slot]
             if reply is not None:
                 raw[slot] = reply
                 src[slot] = "llm"
                 continue
             detail = session.decider.last_failures.get(slot, {})
-            if cause in ("disabled", "transport"):
-                reason_text = detail.get("reason") or cause
-                raise RuntimeError(f"LLM {cause} failure for slot {slot}: {reason_text}")
-            llm_failures[slot] = (cause, detail)
+            reason_text = detail.get("reason") or cause
+            if cause in ("parse", "invalid_action"):
+                raise EpisodeFailure(
+                    "player_error",
+                    slot,
+                    "Player submitted an invalid decision",
+                    f"LLM {cause} for slot {slot}: {reason_text}",
+                )
+            raise EpisodeFailure(
+                "episode_inconclusive",
+                slot,
+                "Model inference unavailable",
+                f"LLM {cause} for slot {slot}: {reason_text}",
+            )
 
         # The pacing floor: an all-scripted episode would otherwise settle
         # twenty rounds in a fraction of a second, which gives the hosted
@@ -494,65 +513,31 @@ async def _run_episode() -> str:
 
         decisions = []
         for slot in range(CONFIG.num_agents):
-            if slot in raw:
-                try:
-                    decisions.append(
-                        parse_decision(raw[slot], slot, CONFIG, engine, MODULE, src.get(slot, "pass"))
+            if slot not in raw:
+                if slot not in session.players:
+                    raise EpisodeFailure(
+                        "episode_inconclusive",
+                        slot,
+                        "Player disconnected before submitting a decision",
+                        f"seat {slot} disconnected without submitting a decision on round {engine.round}",
                     )
-                    continue
-                except ValueError as error:
-                    raw_text = truncate_runes(json.dumps(raw[slot], ensure_ascii=False), 400)
-                    engine.events.append(
-                        {
-                            "kind": "no_submission",
-                            "r": engine.round,
-                            "slot": slot,
-                            "alias": engine.aliases[slot],
-                            "cause": "invalid_action",
-                            "rejection_reason": truncate_runes(str(error), 240),
-                            "raw_reply": raw_text,
-                            "text": f"{engine.aliases[slot]} submitted an invalid decision ({error}); turn rejected.",
-                        }
-                    )
-                    decisions.append(
-                        parse_decision({}, slot, CONFIG, engine, MODULE, "rejected:invalid_action")
-                    )
-                    continue
-
-            if slot in llm_failures:
-                cause, detail = llm_failures[slot]
-                is_rejected = cause in ("parse", "invalid_action")
-                decision_src = f"rejected:{cause}" if is_rejected else f"missed:{cause}"
-                event: dict[str, Any] = {
-                    "kind": "no_submission",
-                    "r": engine.round,
-                    "slot": slot,
-                    "alias": engine.aliases[slot],
-                    "cause": cause,
-                    "text": (
-                        f"{engine.aliases[slot]} reply rejected ({cause})."
-                        if is_rejected
-                        else f"{engine.aliases[slot]} missed the turn ({cause})."
-                    ),
-                }
-                if detail.get("reason"):
-                    event["rejection_reason"] = truncate_runes(str(detail["reason"]), 240)
-                if detail.get("raw_reply"):
-                    event["raw_reply"] = truncate_runes(str(detail["raw_reply"]), 400)
-                engine.events.append(event)
-                decisions.append(parse_decision({}, slot, CONFIG, engine, MODULE, decision_src))
-                continue
-
-            engine.events.append(
-                {
-                    "kind": "no_submission",
-                    "r": engine.round,
-                    "slot": slot,
-                    "alias": engine.aliases[slot],
-                    "text": f"{engine.aliases[slot]} submitted no decision; missed turn.",
-                }
-            )
-            decisions.append(parse_decision({}, slot, CONFIG, engine, MODULE, "pass"))
+                raise EpisodeFailure(
+                    "episode_inconclusive",
+                    slot,
+                    "Player did not submit a decision",
+                    f"seat {slot} submitted no decision on round {engine.round}",
+                )
+            try:
+                decisions.append(
+                    parse_decision(raw[slot], slot, CONFIG, engine, MODULE, src.get(slot, "player"))
+                )
+            except ValueError as error:
+                raise EpisodeFailure(
+                    "player_error",
+                    slot,
+                    "Player submitted an invalid decision",
+                    f"Invalid decision for slot {slot}: {error}",
+                ) from error
 
         settle_round(engine, decisions, CONFIG, MODULE)
         session.decider.capture.record_round(
@@ -569,13 +554,13 @@ async def _broadcast(observations: dict[int, dict]) -> None:
 
 
 async def _fail_episode(error: Exception) -> None:
-    """Explicit failure path: preserve trajectory evidence if configured, never write fabricated results."""
+    """Explicit unscored failure path: preserve private trace and emit native failure envelope."""
     engine = session.engine
     session.failed = True
     session.exit_code = 1
     session.reason = "failed"
     session.done = True
-    failure_outcome = {
+    failure_outcome: dict[str, Any] = {
         "reason": "failed",
         "error": str(error),
         "rounds": engine.round,
@@ -584,16 +569,28 @@ async def _fail_episode(error: Exception) -> None:
         "names": [truncate_runes(name, 64) for name in PLAYER_NAMES],
         "aliases": list(engine.aliases),
     }
+    if isinstance(error, EpisodeFailure):
+        failure_outcome["failure_kind"] = error.kind
+        failure_outcome["failed_policy_index"] = error.slot
+        failure_outcome["public_message"] = error.public_message
     with suppress(Exception):
         await asyncio.to_thread(session.decider.capture.finish, failure_outcome)
-    for slot, websocket in list(session.players.items()):
+    if isinstance(error, EpisodeFailure) and PLAYER_FAILURE_URI:
+        with suppress(Exception):
+            await asyncio.to_thread(
+                write_data,
+                PLAYER_FAILURE_URI,
+                json.dumps(error.to_public_envelope(), ensure_ascii=False),
+                content_type="application/json",
+                http_method=artifact_method("COGAME_PLAYER_FAILURE_METHOD"),
+            )
+    for _slot, websocket in list(session.players.items()):
         with suppress(Exception):
             await websocket.send_json(
                 {
                     "type": "final",
                     "done": True,
                     "reason": "failed",
-                    "error": str(error),
                 }
             )
     if server is not None:
